@@ -390,6 +390,7 @@ gst_rtp_mp4g_pay_setcaps (GstRTPBasePayload * payload, GstCaps * caps)
   const GValue *codec_data;
   const gchar *media_type = NULL;
   gboolean res;
+  const gchar *name;
 
   rtpmp4gpay = GST_RTP_MP4G_PAY (payload);
 
@@ -400,7 +401,6 @@ gst_rtp_mp4g_pay_setcaps (GstRTPBasePayload * payload, GstCaps * caps)
     GST_LOG_OBJECT (rtpmp4gpay, "got codec_data");
     if (G_VALUE_TYPE (codec_data) == GST_TYPE_BUFFER) {
       GstBuffer *buffer;
-      const gchar *name;
 
       buffer = gst_value_get_buffer (codec_data);
       GST_LOG_OBJECT (rtpmp4gpay, "configuring codec_data");
@@ -425,6 +425,23 @@ gst_rtp_mp4g_pay_setcaps (GstRTPBasePayload * payload, GstCaps * caps)
         gst_buffer_unref (rtpmp4gpay->config);
 
       rtpmp4gpay->config = gst_buffer_copy (buffer);
+    }
+  } else {
+    name = gst_structure_get_name (structure);
+
+    if (!strcmp (name, "video/mpeg")) {
+      rtpmp4gpay->profile = g_strdup ("1");
+
+      /* fixed rate */
+      rtpmp4gpay->rate = 90000;
+      /* video stream type */
+      rtpmp4gpay->streamtype = "4";
+      /* no params for video */
+      rtpmp4gpay->params = NULL;
+      /* mode */
+      rtpmp4gpay->mode = "generic";
+
+      media_type = "video";
     }
   }
   if (media_type == NULL)

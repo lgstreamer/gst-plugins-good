@@ -987,14 +987,22 @@ static GstFlowReturn
 gst_v4l2_buffer_pool_poll (GstV4l2BufferPool * pool)
 {
   gint ret;
+  gint64 start = 0, end = 0;
 
   /* In RW mode there is no queue, hence no need to wait while the queue is
    * empty */
   if (pool->obj->mode != GST_V4L2_IO_RW) {
+    start = g_get_monotonic_time ();
+
     GST_OBJECT_LOCK (pool);
     while (pool->empty)
       g_cond_wait (&pool->empty_cond, GST_OBJECT_GET_LOCK (pool));
     GST_OBJECT_UNLOCK (pool);
+
+    end = g_get_monotonic_time ();
+    GST_TRACE_OBJECT (pool,
+        "log=POOL_EMPTY, term=%lld, time=%lld",
+        end - start, g_get_monotonic_time ());
   }
 
   if (!pool->can_poll_device)
@@ -1003,7 +1011,15 @@ gst_v4l2_buffer_pool_poll (GstV4l2BufferPool * pool)
   GST_LOG_OBJECT (pool, "polling device");
 
 again:
+  start = g_get_monotonic_time ();
+
   ret = gst_poll_wait (pool->poll, GST_CLOCK_TIME_NONE);
+
+  end = g_get_monotonic_time ();
+  GST_TRACE_OBJECT (pool,
+      "log=POLL_WAIT, term=%lld, time=%lld",
+      end - start, g_get_monotonic_time ());
+
   if (G_UNLIKELY (ret < 0)) {
     switch (errno) {
       case EBUSY:

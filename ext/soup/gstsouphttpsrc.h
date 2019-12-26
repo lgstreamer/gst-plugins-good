@@ -67,6 +67,7 @@ struct _GstSoupHTTPSrc {
   gint retry_count;            /* Number of retries since we received data */
   gint max_retries;            /* Maximum number of retries */
   gchar *method;               /* HTTP method */
+  gboolean cancel;              /* Cancel current message. */
 
   gboolean got_headers;        /* Already received headers from the server */
   gboolean have_size;          /* Received and parsed Content-Length
@@ -75,6 +76,11 @@ struct _GstSoupHTTPSrc {
   guint64 read_position;       /* Current position. */
   gboolean seekable;           /* FALSE if the server does not support
                                   Range. */
+  guint32 opval;
+  guint32 flagval;
+  gboolean dlna_mode;
+  gboolean is_dtcp;
+
   guint64 request_position;    /* Seek to this position. */
   guint64 stop_position;       /* Stop at this position. */
   gboolean have_body;          /* Indicates if it has just been signaled the
@@ -88,13 +94,16 @@ struct _GstSoupHTTPSrc {
   gboolean ssl_use_system_ca_file;
   GTlsDatabase *tls_database;
   GTlsInteraction *tls_interaction;
+  GstFormat last_seek_format;
+  gboolean time_seek_flag;
+  guint64 request_time;         /* Seek to this position. */
+  guint64 request_cb_position;  /* Cleartext seek position */
 
   GCancellable *cancellable;
   GInputStream *input_stream;
 
-  gint reduce_blocksize_count;
-  gint increase_blocksize_count;
-  guint minimum_blocksize;
+  guint64 start_offset;       /* First byte of a byte range */
+  guint64 end_offset;        /* Last byte of a byte range */
 
   /* Shoutcast/icecast metadata extraction handling. */
   gboolean iradio_mode;
@@ -119,6 +128,8 @@ struct _GstSoupHTTPSrc {
 
 struct _GstSoupHTTPSrcClass {
   GstPushSrcClass parent_class;
+  void (*got_headers) (GstSoupHTTPSrc * soupHTTPsrc, GArray * out_val_array);
+  void (*got_chunk) (GstElement * element, gsize size);
 };
 
 GType gst_soup_http_src_get_type (void);

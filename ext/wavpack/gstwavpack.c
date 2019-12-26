@@ -27,6 +27,8 @@
 
 #include "gstwavpackdec.h"
 #include "gstwavpackenc.h"
+#include "gstwvccombiner.h"
+#include "gstwvfilesrc.h"
 
 /* debug category for common code */
 GST_DEBUG_CATEGORY (wavpack_debug);
@@ -44,6 +46,8 @@ plugin_init (GstPlugin * plugin)
 #endif
 
   return (gst_wavpack_dec_plugin_init (plugin)
+      && gst_wvc_combiner_plugin_init (plugin)
+      && gst_wv_file_src_plugin_init (plugin)
       && gst_wavpack_enc_plugin_init (plugin));
 }
 

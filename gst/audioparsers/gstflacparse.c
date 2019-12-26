@@ -1336,6 +1336,17 @@ gst_flac_parse_handle_headers (GstFlacParse * flacparse)
       "streamheader", &array);
   g_value_unset (&array);
 
+  // For missing vorbiscomment, we don't push a unnecessary header.
+  // This is related in the specific flac file: MFTEVENTFT-26222.
+  gst_pad_set_caps (GST_BASE_PARSE_SRC_PAD (GST_BASE_PARSE (flacparse)), caps);
+  gst_caps_unref (caps);
+
+  g_list_foreach (flacparse->headers, (GFunc) gst_mini_object_unref, NULL);
+  g_list_free (flacparse->headers);
+  flacparse->headers = NULL;
+
+  return res;
+
 push_headers:
 
   gst_pad_set_caps (GST_BASE_PARSE_SRC_PAD (GST_BASE_PARSE (flacparse)), caps);
@@ -1510,6 +1521,7 @@ gst_flac_parse_handle_block_type (GstFlacParse * flacparse, guint type,
     case 4:                    /* VORBIS_COMMENT */
       GST_INFO_OBJECT (flacparse, "VORBISCOMMENT header");
       ret = gst_flac_parse_handle_vorbiscomment (flacparse, sbuffer);
+      ret = FALSE;
       break;
     case 5:                    /* CUESHEET */
       GST_INFO_OBJECT (flacparse, "CUESHEET header");
@@ -1518,9 +1530,11 @@ gst_flac_parse_handle_block_type (GstFlacParse * flacparse, guint type,
     case 6:                    /* PICTURE */
       GST_INFO_OBJECT (flacparse, "PICTURE header");
       ret = gst_flac_parse_handle_picture (flacparse, sbuffer);
+      ret = FALSE;
       break;
     case 1:                    /* PADDING */
       GST_INFO_OBJECT (flacparse, "PADDING header");
+      ret = FALSE;
       break;
     case 2:                    /* APPLICATION */
       GST_INFO_OBJECT (flacparse, "APPLICATION header");

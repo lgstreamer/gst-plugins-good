@@ -87,6 +87,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+#include <glib/gprintf.h>
+
 #include <gst/net/gstnet.h>
 #include <gst/sdp/gstsdpmessage.h>
 #include <gst/sdp/gstmikey.h>
@@ -308,6 +310,16 @@ enum
   PROP_MAX_TS_OFFSET,
   PROP_DEFAULT_VERSION,
   PROP_BACKCHANNEL,
+  PROP_SMART_PROPERTIES,
+  PROP_DRM_HEADER,
+  PROP_FIRST_PTS,
+  PROP_LAST
+};
+
+enum
+{
+  APP_TYPE_DEFAULT = 0,
+  APP_TYPE_SKB,
 };
 
 #define GST_TYPE_RTSP_NAT_METHOD (gst_rtsp_nat_method_get_type())
@@ -397,6 +409,11 @@ typedef struct
   GstCaps *caps;
 } PtMapItem;
 
+static gboolean gst_rtspsrc_check_timeout (GstRTSPSrc * src, GstRTSPResult res);
+static GstRTSPResult gst_rtspsrc_send_speed (GstRTSPSrc * src);
+static void gst_rtspsrc_do_send_speed (GstRTSPSrc * src);
+
+
 /* commands we send to out loop to notify it of events */
 #define CMD_OPEN       (1 << 0)
 #define CMD_PLAY       (1 << 1)
@@ -405,9 +422,10 @@ typedef struct
 #define CMD_WAIT       (1 << 4)
 #define CMD_RECONNECT  (1 << 5)
 #define CMD_LOOP       (1 << 6)
+#define CMD_SPEED      (1 << 7)
 
 /* mask for all commands */
-#define CMD_ALL         ((CMD_LOOP << 1) - 1)
+#define CMD_ALL         ((CMD_SPEED << 1) - 1)
 
 #define GST_ELEMENT_PROGRESS(el, type, code, text)      \
 G_STMT_START {                                          \
@@ -735,6 +753,18 @@ gst_rtspsrc_class_init (GstRTSPSrcClass * klass)
           "TLS certificate validation flags used to validate the server certificate",
           G_TYPE_TLS_CERTIFICATE_FLAGS, DEFAULT_TLS_VALIDATION_FLAGS,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_SMART_PROPERTIES,
+      g_param_spec_string ("smart-properties", "Smart Properties",
+          "Hold various property values for reply custom query", NULL,
+          G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_DRM_HEADER,
+      g_param_spec_string ("drm-header", "drm-header",
+          "SKB CAS DRM header", NULL,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_FIRST_PTS,
+      g_param_spec_double ("first-pts", "first-pts", "SKB FIRST PTS", 0.0,
+          65536.0, 0.0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
   /**
    * GstRTSPSrc::tls-database:
@@ -1103,9 +1133,20 @@ gst_rtspsrc_init (GstRTSPSrc * src)
   g_rec_mutex_init (&src->state_rec_lock);
 
   src->state = GST_RTSP_STATE_INVALID;
+  src->running = FALSE;
 
   g_mutex_init (&src->conninfo.send_lock);
   g_mutex_init (&src->conninfo.recv_lock);
+
+  src->smart_prop = NULL;
+  src->app_type = APP_TYPE_DEFAULT;
+  src->drm_header = NULL;
+  src->first_pts = 0.0;
+  src->remove_drm_header = TRUE;
+  src->speed_control = FALSE;
+  src->close_control = FALSE;
+  src->resumed_playpos = 0;
+  src->timeout_count = 0;
 
   GST_OBJECT_FLAG_SET (src, GST_ELEMENT_FLAG_SOURCE);
   gst_bin_set_suppressed_flags (GST_BIN (src),
@@ -1143,6 +1184,11 @@ gst_rtspsrc_finalize (GObject * object)
 
   if (rtspsrc->tls_interaction)
     g_object_unref (rtspsrc->tls_interaction);
+
+  if (rtspsrc->smart_prop) {
+    gst_structure_free (rtspsrc->smart_prop);
+    rtspsrc->smart_prop = NULL;
+  }
 
   /* free locks */
   g_rec_mutex_clear (&rtspsrc->stream_rec_lock);
@@ -1238,6 +1284,16 @@ gst_rtspsrc_set_tcp_timeout (GstRTSPSrc * rtspsrc, guint64 timeout)
     rtspsrc->ptcp_timeout = NULL;
 }
 
+static gboolean
+gst_rtspsrc_set_smart_properties (GQuark field_id, const GValue * value,
+    gpointer user_data)
+{
+  GstRTSPSrc *src = GST_RTSPSRC_CAST (user_data);
+
+  gst_structure_id_set_value (src->smart_prop, field_id, value);
+  return TRUE;
+}
+
 static void
 gst_rtspsrc_set_property (GObject * object, guint prop_id, const GValue * value,
     GParamSpec * pspec)
@@ -1274,6 +1330,9 @@ gst_rtspsrc_set_property (GObject * object, guint prop_id, const GValue * value,
       break;
     case PROP_CONNECTION_SPEED:
       rtspsrc->connection_speed = g_value_get_uint64 (value);
+      if (rtspsrc->app_type == APP_TYPE_SKB &&
+          (gint64) rtspsrc->connection_speed > 0)
+        gst_rtspsrc_loop_send_cmd (rtspsrc, CMD_SPEED, CMD_LOOP);
       break;
     case PROP_NAT_METHOD:
       rtspsrc->nat_method = g_value_get_enum (value);
@@ -1399,6 +1458,41 @@ gst_rtspsrc_set_property (GObject * object, guint prop_id, const GValue * value,
     case PROP_BACKCHANNEL:
       rtspsrc->backchannel = g_value_get_enum (value);
       break;
+    case PROP_SMART_PROPERTIES:
+    {
+      GstStructure *s = NULL;
+      const gchar *maps = g_value_get_string (value);
+
+      s = gst_structure_from_string (maps, NULL);
+      GST_INFO_OBJECT (rtspsrc,
+          "passed string is [%s], result structure is [%" GST_PTR_FORMAT "]",
+          maps, s);
+
+      if (!rtspsrc->smart_prop)
+        rtspsrc->smart_prop = gst_structure_copy (s);
+      else
+        gst_structure_foreach (s, gst_rtspsrc_set_smart_properties, rtspsrc);
+
+      if (rtspsrc->smart_prop) {
+        const gchar *apptype_string =
+            gst_structure_get_string (rtspsrc->smart_prop, "app-type");
+        if (apptype_string != NULL) {
+          if (!g_strcmp0 (apptype_string, "SKB"))
+            rtspsrc->app_type = APP_TYPE_SKB;
+        }
+        if (gst_structure_get_clock_time (rtspsrc->smart_prop, "play-offset",
+                (GstClockTime *) & rtspsrc->resumed_playpos)) {
+          if (rtspsrc->resumed_playpos > 0)
+            rtspsrc->resumed_playpos *= GST_MSECOND;
+          GST_INFO_OBJECT (rtspsrc,
+              "resumed play offset %" GST_TIME_FORMAT,
+              GST_TIME_ARGS (rtspsrc->resumed_playpos));
+        } else {
+          GST_INFO_OBJECT (rtspsrc, "fail to parse play-offset");
+        }
+      }
+      break;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -1559,6 +1653,12 @@ gst_rtspsrc_get_property (GObject * object, guint prop_id, GValue * value,
       break;
     case PROP_BACKCHANNEL:
       g_value_set_enum (value, rtspsrc->backchannel);
+      break;
+    case PROP_DRM_HEADER:
+      g_value_set_string (value, rtspsrc->drm_header);
+      break;
+    case PROP_FIRST_PTS:
+      g_value_set_double (value, rtspsrc->first_pts);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -2428,6 +2528,15 @@ gst_rtspsrc_perform_seek (GstRTSPSrc * src, GstEvent * event)
     stop_type = GST_SEEK_TYPE_SET;
   }
 
+  if (src->app_type == APP_TYPE_SKB) {
+    gst_rtspsrc_get_position (src);
+    if (src->last_pos == -1) {
+      GST_INFO_OBJECT (src, "seek is in progress, pos-%" GST_TIME_FORMAT,
+          GST_TIME_ARGS (src->last_pos));
+      return TRUE;
+    }
+  }
+
   /* get flush flag */
   flush = flags & GST_SEEK_FLAG_FLUSH;
   skip = flags & GST_SEEK_FLAG_SKIP;
@@ -2478,7 +2587,8 @@ gst_rtspsrc_perform_seek (GstRTSPSrc * src, GstEvent * event)
   if (playing) {
     /* obtain current position in case seek fails */
     gst_rtspsrc_get_position (src);
-    gst_rtspsrc_pause (src, FALSE);
+    if (src->app_type != APP_TYPE_SKB)
+      gst_rtspsrc_pause (src, FALSE);
   }
   src->skip = skip;
 
@@ -2701,6 +2811,27 @@ gst_rtspsrc_handle_internal_src_query (GstPad * pad, GstObject * parent,
   return res;
 }
 
+static gboolean
+gst_rtspsrc_copy_smart_properties (GQuark field_id, GValue * value,
+    gpointer user_data)
+{
+  GstRTSPSrc *src = GST_RTSPSRC_CAST (user_data);
+
+  const GValue *src_value;
+
+  if (!gst_structure_id_has_field (src->smart_prop, field_id)) {
+    GST_WARNING_OBJECT (src, "%s field does not exist in smart-properties",
+        g_quark_to_string (field_id));
+    return TRUE;
+  }
+
+  src_value = gst_structure_id_get_value (src->smart_prop, field_id);
+  g_value_unset (value);
+  g_value_init (value, G_VALUE_TYPE (src_value));
+  g_value_copy (src_value, value);
+  return TRUE;
+}
+
 /* this query is executed on the ghost source pad exposed on rtspsrc. */
 static gboolean
 gst_rtspsrc_handle_src_query (GstPad * pad, GstObject * parent,
@@ -2773,6 +2904,21 @@ gst_rtspsrc_handle_src_query (GstPad * pad, GstObject * parent,
         g_free (uri);
         res = TRUE;
       }
+      break;
+    }
+    case GST_QUERY_CUSTOM:
+    {
+      GstStructure *s;
+
+      s = gst_query_writable_structure (query);
+      if (gst_structure_has_name (s, "smart-properties")) {
+        GST_INFO_OBJECT (src, "got %s query", gst_structure_get_name (s));
+
+        gst_structure_map_in_place (s, gst_rtspsrc_copy_smart_properties, src);
+
+        res = TRUE;
+      } else
+        res = FALSE;
       break;
     }
     default:
@@ -3107,7 +3253,7 @@ unknown_stream:
 static void
 gst_rtspsrc_do_stream_eos (GstRTSPSrc * src, GstRTSPStream * stream)
 {
-  GST_DEBUG_OBJECT (src, "setting stream for session %u to EOS", stream->id);
+  GST_INFO_OBJECT (src, "setting stream for session %u to EOS", stream->id);
 
   if (stream->eos)
     goto was_eos;
@@ -4838,6 +4984,15 @@ gst_rtspsrc_send_keep_alive (GstRTSPSrc * src)
     return GST_RTSP_OK;
   }
 
+  if (src->app_type == APP_TYPE_SKB) {
+    if (src->task == NULL || src->state == GST_RTSP_STATE_READY) {
+      GST_INFO_OBJECT (src, "GST_RTSP_EINTR with src->task is NULL");
+      return GST_RTSP_EINTR;
+    }
+    gst_rtsp_connection_reset_timeout (src->conninfo.connection);
+    return GST_RTSP_OK;
+  }
+
   GST_DEBUG_OBJECT (src, "creating server keep-alive");
 
   /* find a method to use for keep-alive */
@@ -5134,11 +5289,41 @@ gst_rtspsrc_loop_interleaved (GstRTSPSrc * src)
     GST_DEBUG_OBJECT (src, "doing receive with timeout %ld seconds, %ld usec",
         tv_timeout.tv_sec, tv_timeout.tv_usec);
 
+    if (src->app_type == APP_TYPE_SKB && src->running) {
+      if (src->remove_drm_header && src->drm_header) {
+
+        GST_INFO_OBJECT (src,
+            "try to remove drm header information from VOD stream");
+        res =
+            gst_rtsp_connection_remove_drmheader (src->conninfo.connection,
+            src->drm_header, src->ptcp_timeout);
+        src->remove_drm_header = FALSE;
+        switch (res) {
+          case GST_RTSP_OK:
+            GST_INFO_OBJECT (src,
+                "Success to remove drm header information from VOD stream");
+            break;
+          case GST_RTSP_EINTR:
+            goto interrupt;
+          default:
+            goto receive_error;
+        }
+
+        if (src->conninfo.connection)
+          gst_rtsp_connection_set_qos_dscp (src->conninfo.connection, 24);
+      }
+    }
+
     /* protect the connection with the connection lock so that we can see when
      * we are finished doing server communication */
     res =
         gst_rtspsrc_connection_receive (src, &src->conninfo,
         &message, src->ptcp_timeout);
+
+    if (gst_rtspsrc_check_timeout (src, res)) {
+      GST_INFO_OBJECT (src, "GST_RTSP_EINTR with receive timeout");
+      goto interrupt;
+    }
 
     switch (res) {
       case GST_RTSP_OK:
@@ -5157,7 +5342,11 @@ gst_rtspsrc_loop_interleaved (GstRTSPSrc * src)
         /* go EOS when the server closed the connection */
         goto server_eof;
       default:
-        goto receive_error;
+        if (src->app_type == APP_TYPE_SKB) {
+          GST_ERROR_OBJECT (src, "error type %d", res);
+          break;
+        } else
+          goto receive_error;
     }
 
     switch (message.type) {
@@ -5648,6 +5837,12 @@ pause:
        * EOS so the app knows about the error first. */
       GST_ELEMENT_FLOW_ERROR (src, ret);
       gst_rtspsrc_push_event (src, gst_event_new_eos ());
+    } else if (src->app_type == APP_TYPE_SKB) {
+      if (src->task != NULL &&
+          src->connection_speed != DEFAULT_CONNECTION_SPEED) {
+        GST_INFO_OBJECT (src, "handling CMD_SPEED");
+        return FALSE;
+      }
     }
     gst_rtspsrc_loop_send_cmd (src, CMD_WAIT, CMD_LOOP);
     return FALSE;
@@ -5839,8 +6034,20 @@ gst_rtsp_src_receive_response (GstRTSPSrc * src, GstRTSPConnInfo * conninfo,
 {
   GstRTSPStatusCode thecode;
   gchar *content_base = NULL;
-  GstRTSPResult res = gst_rtspsrc_connection_receive (src, conninfo,
-      response, src->ptcp_timeout);
+  GstRTSPResult res;
+
+next:
+  res =
+      gst_rtspsrc_connection_receive (src, conninfo, response,
+      src->ptcp_timeout);
+
+  if ((src->app_type == APP_TYPE_SKB) && (res == GST_RTSP_EINTR)) {
+    if (!src->speed_control && !src->close_control) {
+      GST_INFO_OBJECT (src, "receive - GST_RTSP_EINTR, try again");
+      gst_rtsp_connection_flush (conninfo->connection, FALSE);
+      goto next;
+    }
+  }
 
   if (res < 0)
     goto receive_error;
@@ -5865,7 +6072,6 @@ gst_rtsp_src_receive_response (GstRTSPSrc * src, GstRTSPConnInfo * conninfo,
       /* get next response */
       GST_DEBUG_OBJECT (src, "handle data response message");
       gst_rtspsrc_handle_data (src, response);
-
       /* Not a response, receive next message */
       return gst_rtsp_src_receive_response (src, conninfo, response, code);
     default:
@@ -5904,13 +6110,23 @@ receive_error:
     switch (res) {
       case GST_RTSP_EEOF:
         return GST_RTSP_EEOF;
+      case GST_RTSP_EPARSE:
+        if (src->app_type == APP_TYPE_SKB) {
+          GST_INFO_OBJECT (src, "handling eparse error %d", res);
+          return GST_RTSP_OK;
+        }
       default:
       {
         gchar *str = gst_rtsp_strresult (res);
 
         if (res != GST_RTSP_EINTR) {
-          GST_ELEMENT_ERROR (src, RESOURCE, READ, (NULL),
-              ("Could not receive message. (%s)", str));
+          if (src->speed_control) {
+            GST_WARNING_OBJECT (src, "ignore receive error %s", str);
+            g_free (str);
+            return GST_RTSP_OK;
+          } else
+            GST_ELEMENT_ERROR (src, RESOURCE, READ, (NULL),
+                ("Could not receive message. (%s)", str));
         } else {
           GST_WARNING_OBJECT (src, "receive interrupted");
         }
@@ -5961,7 +6177,15 @@ again:
 
   DEBUG_RTSP (src, request);
 
+resend:
   res = gst_rtspsrc_connection_send (src, conninfo, request, src->ptcp_timeout);
+  if ((src->app_type == APP_TYPE_SKB) && (res == GST_RTSP_EINTR)) {
+    if (!src->speed_control && !src->close_control) {
+      GST_INFO_OBJECT (src, "send - GST_RTSP_EINTR, try again");
+      gst_rtsp_connection_flush (conninfo->connection, FALSE);
+      goto resend;
+    }
+  }
   if (res < 0)
     goto send_error;
 
@@ -5989,8 +6213,13 @@ send_error:
     gchar *str = gst_rtsp_strresult (res);
 
     if (res != GST_RTSP_EINTR) {
-      GST_ELEMENT_ERROR (src, RESOURCE, WRITE, (NULL),
-          ("Could not send message. (%s)", str));
+      if (src->speed_control) {
+        GST_WARNING_OBJECT (src, "ignore send error %s", str);
+        g_free (str);
+        return GST_RTSP_OK;
+      } else
+        GST_ELEMENT_ERROR (src, RESOURCE, WRITE, (NULL),
+            ("Could not send message. (%s)", str));
     } else {
       GST_WARNING_OBJECT (src, "send interrupted");
     }
@@ -7443,6 +7672,29 @@ restart:
   gst_sdp_message_new (sdp);
   gst_sdp_message_parse_buffer (data, size, *sdp);
 
+  if (src->app_type == APP_TYPE_SKB) {
+    GstSDPMedia *pMedia = &g_array_index ((*sdp)->medias, GstSDPMedia, 0);
+    if (pMedia->attributes->len > 0) {
+
+      guint i;
+      for (i = 0; i < pMedia->attributes->len; i++) {
+
+        GstSDPAttribute *pAttr =
+            &g_array_index (pMedia->attributes, GstSDPAttribute, i);
+        if (g_strcmp0 (pAttr->key, "drm") == 0) {
+          src->drm_header = pAttr->value;
+          GST_INFO_OBJECT (src, "SKB VOD:DRMHeader - %s, size -%zu \n",
+              src->drm_header, strlen (src->drm_header));
+        }
+        if (g_strcmp0 (pAttr->key, "firstpts") == 0) {
+          src->first_pts = g_strtod (pAttr->value, NULL);
+          GST_INFO_OBJECT (src, "SKB VOD:FirstPts - %s -> %f \n", pAttr->value,
+              src->first_pts);
+        }
+      }
+    }
+  }
+
   /* clean up any messages */
   gst_rtsp_message_unset (&request);
   gst_rtsp_message_unset (&response);
@@ -7929,7 +8181,19 @@ restart:
     if (res < 0)
       goto create_request_failed;
 
+    if (src->app_type == APP_TYPE_SKB) {
+      gst_rtsp_message_add_header (&request, GST_RTSP_HDR_USER_AGENT,
+          "Zooinnet SDK  v1.3.12");
+    }
+
     if (src->need_range && src->seekable >= 0.0) {
+
+      if (src->app_type == APP_TYPE_SKB && src->resumed_playpos > 0) {
+        segment->position = src->resumed_playpos;
+        src->segment.position = src->resumed_playpos;
+        src->resumed_playpos = 0;
+      }
+
       hval = gen_range_header (src, segment);
 
       gst_rtsp_message_take_header (&request, GST_RTSP_HDR_RANGE, hval);
@@ -8335,7 +8599,7 @@ gst_rtspsrc_thread (GstRTSPSrc * src)
   GST_OBJECT_LOCK (src);
   cmd = src->pending_cmd;
   if (cmd == CMD_RECONNECT || cmd == CMD_PLAY || cmd == CMD_PAUSE
-      || cmd == CMD_LOOP || cmd == CMD_OPEN)
+      || cmd == CMD_LOOP || cmd == CMD_SPEED)
     src->pending_cmd = CMD_LOOP;
   else
     src->pending_cmd = CMD_WAIT;
@@ -8352,12 +8616,17 @@ gst_rtspsrc_thread (GstRTSPSrc * src)
       gst_rtspsrc_open (src, TRUE);
       break;
     case CMD_PLAY:
-      gst_rtspsrc_play (src, &src->segment, TRUE, NULL);
+      if (gst_rtspsrc_play (src, &src->segment, TRUE, NULL) < 0) {
+        GST_OBJECT_LOCK (src);
+        src->pending_cmd = CMD_WAIT;
+        GST_OBJECT_UNLOCK (src);
+      }
       break;
     case CMD_PAUSE:
       gst_rtspsrc_pause (src, TRUE);
       break;
     case CMD_CLOSE:
+      src->close_control = FALSE;
       gst_rtspsrc_close (src, TRUE, FALSE);
       break;
     case CMD_LOOP:
@@ -8365,6 +8634,9 @@ gst_rtspsrc_thread (GstRTSPSrc * src)
       break;
     case CMD_RECONNECT:
       gst_rtspsrc_reconnect (src, FALSE);
+      break;
+    case CMD_SPEED:
+      gst_rtspsrc_do_send_speed (src);
       break;
     default:
       break;
@@ -8414,6 +8686,7 @@ static gboolean
 gst_rtspsrc_stop (GstRTSPSrc * src)
 {
   GstTask *task;
+  gboolean only_close = TRUE;
 
   GST_DEBUG_OBJECT (src, "stopping");
 
@@ -8441,8 +8714,13 @@ gst_rtspsrc_stop (GstRTSPSrc * src)
   }
   GST_OBJECT_UNLOCK (src);
 
+  if (src->close_control) {
+    only_close = FALSE;
+    src->close_control = FALSE;
+  }
+
   /* ensure synchronously all is closed and clean */
-  gst_rtspsrc_close (src, FALSE, TRUE);
+  gst_rtspsrc_close (src, FALSE, only_close);
 
   return TRUE;
 }
@@ -8506,7 +8784,8 @@ gst_rtspsrc_change_state (GstElement * element, GstStateChange transition)
       ret = GST_STATE_CHANGE_NO_PREROLL;
       break;
     case GST_STATE_CHANGE_PAUSED_TO_READY:
-      gst_rtspsrc_loop_send_cmd (rtspsrc, CMD_CLOSE, CMD_ALL);
+      rtspsrc->close_control = TRUE;
+      gst_rtspsrc_loop_send_cmd (rtspsrc, CMD_CLOSE, CMD_PAUSE | CMD_SPEED);
       ret = GST_STATE_CHANGE_SUCCESS;
       break;
     case GST_STATE_CHANGE_READY_TO_NULL:
@@ -8680,6 +8959,119 @@ gst_rtspsrc_uri_handler_init (gpointer g_iface, gpointer iface_data)
   iface->get_protocols = gst_rtspsrc_uri_get_protocols;
   iface->get_uri = gst_rtspsrc_uri_get_uri;
   iface->set_uri = gst_rtspsrc_uri_set_uri;
+}
+
+static gboolean
+gst_rtspsrc_check_timeout (GstRTSPSrc * src, GstRTSPResult res)
+{
+  gboolean ret = FALSE;
+
+  if (res == GST_RTSP_ETIMEOUT) {
+    if (src->state == GST_RTSP_STATE_PLAYING) {
+      GST_INFO_OBJECT (src, "timeout");
+      src->timeout_count++;
+      if (src->app_type == APP_TYPE_SKB && src->timeout_count > 2) {
+        ret = TRUE;
+      }
+    }
+    gst_rtsp_connection_reset_timeout (src->conninfo.connection);
+  } else
+    src->timeout_count = 0;
+
+  return ret;
+}
+
+static GstRTSPResult
+gst_rtspsrc_send_speed (GstRTSPSrc * src)
+{
+  GstRTSPMessage request = { 0, }, response = {
+  0,};
+  GstRTSPResult res;
+  GstRTSPMethod method;
+  gchar *control = NULL;
+  gchar hval[G_ASCII_DTOSTR_BUF_SIZE] = { 0, };
+  gdouble speed;
+
+  src->speed_control = TRUE;
+
+  if (src->state == GST_RTSP_STATE_READY)
+    method = GST_RTSP_PAUSE;
+  else if (src->state == GST_RTSP_STATE_PLAYING)
+    method = GST_RTSP_PLAY;
+  else
+    goto error_playing_state;
+
+  if (!src->conninfo.connection || !src->conninfo.connected)
+    goto no_connection;
+
+  /* construct a control url */
+  if (src->control)
+    control = src->control;
+  else
+    control = src->conninfo.url_str;
+
+  if (control == NULL)
+    goto error_no_url;
+
+  res = gst_rtsp_message_init_request (&request, method, control);
+  if (res < 0)
+    goto error_send_speed;
+
+  gst_rtsp_message_add_header (&request, GST_RTSP_HDR_USER_AGENT,
+      "Zooinnet SDK  v1.3.12");
+
+  speed = (gdouble) src->connection_speed / 10.000000;
+  g_sprintf (hval, "%06f", speed);
+  gst_rtsp_message_add_header (&request, GST_RTSP_HDR_SPEED, hval);
+
+  GST_INFO_OBJECT (src, "connection speed %" G_GUINT64_FORMAT,
+      src->connection_speed);
+  res = gst_rtspsrc_try_send (src, &src->conninfo, &request, &response, NULL);
+  if (res < 0)
+    goto error_send_speed;
+
+  gst_rtsp_message_unset (&request);
+  gst_rtsp_message_unset (&response);
+
+  return GST_RTSP_OK;
+
+error_playing_state:
+  {
+    GST_ERROR_OBJECT (src, "Not Playing State");
+    return GST_RTSP_OK;
+  }
+no_connection:
+  {
+    GST_ERROR_OBJECT (src, "No Connection");
+    return GST_RTSP_OK;
+  }
+error_no_url:
+  {
+    GST_ERROR_OBJECT (src, "No Control URL");
+    return GST_RTSP_OK;
+  }
+error_send_speed:
+  {
+    gchar *str = gst_rtsp_strresult (res);
+    gst_rtsp_message_unset (&request);
+    GST_ERROR_OBJECT (src, "Could not send speed(%s)", str);
+    g_free (str);
+    return res;
+  }
+}
+
+static void
+gst_rtspsrc_do_send_speed (GstRTSPSrc * src)
+{
+  if (src->app_type == APP_TYPE_SKB) {
+
+    if (src->task != NULL && src->connection_speed != DEFAULT_CONNECTION_SPEED) {
+      gst_rtspsrc_send_speed (src);
+      src->speed_control = FALSE;
+      src->connection_speed = DEFAULT_CONNECTION_SPEED;
+    }
+  }
+  return;
 }
 
 typedef struct _RTSPKeyValue

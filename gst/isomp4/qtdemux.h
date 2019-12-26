@@ -45,7 +45,8 @@ G_BEGIN_DECLS
 #define GST_QT_DEMUX_PRIVATE_TAG "private-qt-tag"
 #define GST_QT_DEMUX_CLASSIFICATION_TAG "classification"
 
-#define GST_QTDEMUX_MAX_STREAMS         32
+#define DOLBYHDR_SUPPORT
+#define MP4_PUSHMODE_TRICK
 
 typedef struct _GstQTDemux GstQTDemux;
 typedef struct _GstQTDemuxClass GstQTDemuxClass;
@@ -73,7 +74,16 @@ struct _GstQTDemux {
 
   gboolean posted_redirect;
 
-  QtDemuxStream *streams[GST_QTDEMUX_MAX_STREAMS];
+  /* Protect pad exposing from flush event */
+  GMutex expose_lock;
+
+  /* Avoid multiple seek event pushed at qtdemux sink pad at the same time */
+  GMutex seekevent_lock;
+
+  /* list of QtDemuxStream */
+  GList *active_streams;
+  GList *old_streams;
+
   gint     n_streams;
   gint     n_video_streams;
   gint     n_audio_streams;
@@ -111,6 +121,7 @@ struct _GstQTDemux {
   guint header_size;
 
   GstTagList *tag_list;
+  GstTagList *upstream_tag_list;
 
   /* configured playback region */
   GstSegment segment;
@@ -152,6 +163,9 @@ struct _GstQTDemux {
   guint8 *cenc_aux_info_sizes;
   guint32 cenc_aux_sample_count;
 
+  /* Whether the parent bin is streams-aware, meaning we can
+   * add/remove streams at any point in time */
+  gboolean streams_aware;
 
   /*
    * ALL VARIABLES BELOW ARE ONLY USED IN PUSH-BASED MODE
@@ -229,6 +243,33 @@ struct _GstQTDemux {
    * header start.
    * Note : This is not computed from the GST_BUFFER_OFFSET field */
   guint64 fragment_start_offset;
+
+#ifdef DOLBYHDR_SUPPORT
+  /* Dolby HDR */
+  gboolean dolby_vision_support;
+  gboolean is_dolby_hdr;
+  gboolean has_dolby_bl_cand;
+  gboolean has_dolby_el_cand;
+
+  /* Dolby HDR dvcC info. */
+  gint8 dv_profile;
+  gboolean rpu_present_flag;
+  gboolean el_present_flag;
+  gboolean bl_present_flag;
+#endif
+
+#ifdef MP4_PUSHMODE_TRICK
+  gdouble demux_rate;
+  gboolean pushed_Iframe;
+  gboolean byte_seeking;
+  gboolean flushing;
+#endif
+  guint32 dlna_opval;
+  gboolean isInterleaved;
+  gboolean isStartKeyFrame;
+  gboolean isBigData;
+  gboolean configure_dvr;
+  gboolean adaptive_mode;
 };
 
 struct _GstQTDemuxClass {

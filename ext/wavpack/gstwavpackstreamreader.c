@@ -35,8 +35,8 @@ gst_wavpack_stream_reader_read_bytes (void *id, void *data, int32_t bcount)
   uint32_t left = rid->length - rid->position;
   uint32_t to_read = MIN (left, bcount);
 
-  GST_DEBUG ("Trying to read %d of %d bytes from position %d", bcount,
-      rid->length, rid->position);
+  GST_DEBUG ("%s: Trying to read %d of %d bytes from position %d", rid->name,
+      bcount, rid->length, rid->position);
 
   if (to_read > 0) {
     memmove (data, rid->buffer + rid->position, to_read);

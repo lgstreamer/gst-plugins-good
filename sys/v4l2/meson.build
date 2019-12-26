@@ -25,6 +25,26 @@ v4l2_sources = [
   'tunernorm.c'
 ]
 
+have_v4l2_ext = true
+message('Checking headers needed for v4l2scalersrc plugin...')
+foreach hdr : ['linux/v4l2-ext/videodev2-ext.h']
+  if have_v4l2_ext
+    if not cc.has_header(hdr)
+      have_v4l2_ext = false
+    endif
+  endif
+endforeach
+
+if have_v4l2_ext
+  cdata.set('HAVE_LINUX_EXT', true)
+  v4l2_sources += [
+    'gstv4l2scalerobject.c',
+    'gstv4l2scalersrc.c',
+  ]
+else
+  cdata.set('HAVE_LINUX_EXT', false)
+endif
+
 cdata.set('GST_V4L2_ENABLE_PROBE', get_option('v4l2-probe'))
 
 if cc.has_header('linux/videodev2.h') or cc.has_header('sys/videodev2.h') or cc.has_header('sys/videoio.h')

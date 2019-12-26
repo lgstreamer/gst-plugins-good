@@ -52,7 +52,7 @@
 #include "gstwavpackdec.h"
 #include "gstwavpackcommon.h"
 #include "gstwavpackstreamreader.h"
-
+#include "gstwvcmeta.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_wavpack_dec_debug);
 #define GST_CAT_DEFAULT gst_wavpack_dec_debug
@@ -61,6 +61,10 @@ static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("audio/x-wavpack, "
+        "depth = (int) [ 1, 32 ], "
+        "channels = (int) [ 1, 8 ], "
+        "rate = (int) [ 6000, 192000 ], " "framed = (boolean) true;"
+        "audio/x-wavpack(meta:GstWVCorrection), "
         "depth = (int) [ 1, 32 ], "
         "channels = (int) [ 1, 8 ], "
         "rate = (int) [ 6000, 192000 ], " "framed = (boolean) true")
@@ -124,8 +128,14 @@ gst_wavpack_dec_class_init (GstWavpackDecClass * klass)
 static void
 gst_wavpack_dec_reset (GstWavpackDec * dec)
 {
+  dec->wv_id.name = "wv";
   dec->wv_id.buffer = NULL;
   dec->wv_id.position = dec->wv_id.length = 0;
+
+  dec->wvc_id.name = "wvc";
+  dec->wvc_id.buffer = NULL;
+  dec->wvc_id.position = 0;
+  dec->wvc_id.length = 0;
 
   dec->channels = 0;
   dec->channel_mask = 0;
@@ -272,6 +282,7 @@ static GstFlowReturn
 gst_wavpack_dec_handle_frame (GstAudioDecoder * bdec, GstBuffer * buf)
 {
   GstWavpackDec *dec;
+  GstWVCMeta *wvc_meta = NULL;
   GstBuffer *outbuf = NULL;
   GstFlowReturn ret = GST_FLOW_OK;
   WavpackHeader wph;
@@ -280,6 +291,7 @@ gst_wavpack_dec_handle_frame (GstAudioDecoder * bdec, GstBuffer * buf)
   gint width, depth, i, j, max;
   gint32 *dec_data = NULL;
   guint8 *out_data;
+  GstMapInfo wvc_map = GST_MAP_INFO_INIT;
   GstMapInfo map, omap;
 
   dec = GST_WAVPACK_DEC (bdec);
@@ -305,6 +317,17 @@ gst_wavpack_dec_handle_frame (GstAudioDecoder * bdec, GstBuffer * buf)
   dec->wv_id.length = map.size;
   dec->wv_id.position = 0;
 
+  wvc_meta = gst_buffer_get_wvc_meta (buf);
+  if (wvc_meta && gst_buffer_map (wvc_meta->wvc_buf, &wvc_map, GST_MAP_READ)) {
+    dec->wvc_id.buffer = wvc_map.data;
+    dec->wvc_id.length = wvc_map.size;
+    dec->wvc_id.position = 0;
+  } else {
+    dec->wvc_id.buffer = NULL;
+    dec->wvc_id.length = 0;
+    dec->wvc_id.position = 0;
+  }
+
   /* create a new wavpack context if there is none yet but if there
    * was already one (i.e. caps were set on the srcpad) check whether
    * the new one has the same caps */
@@ -312,7 +335,7 @@ gst_wavpack_dec_handle_frame (GstAudioDecoder * bdec, GstBuffer * buf)
     gchar error_msg[80];
 
     dec->context = WavpackOpenFileInputEx (dec->stream_reader,
-        &dec->wv_id, NULL, error_msg, OPEN_STREAMING, 0);
+        &dec->wv_id, &dec->wvc_id, error_msg, OPEN_STREAMING, 0);
 
     /* expect this to work */
     if (!dec->context) {
@@ -406,6 +429,11 @@ gst_wavpack_dec_handle_frame (GstAudioDecoder * bdec, GstBuffer * buf)
     g_assert_not_reached ();
   }
 
+  if (wvc_meta != NULL && wvc_map.data != NULL) {
+    gst_buffer_unmap (wvc_meta->wvc_buf, &wvc_map);
+    wvc_meta = NULL;
+  }
+
   gst_buffer_unmap (outbuf, &omap);
   gst_buffer_unmap (buf, &map);
   buf = NULL;
@@ -415,8 +443,13 @@ gst_wavpack_dec_handle_frame (GstAudioDecoder * bdec, GstBuffer * buf)
   ret = gst_audio_decoder_finish_frame (bdec, outbuf, 1);
 
 out:
-  if (buf)
+
+  if (buf) {
+    if (wvc_meta != NULL && wvc_map.data != NULL) {
+      gst_buffer_unmap (wvc_meta->wvc_buf, &wvc_map);
+    }
     gst_buffer_unmap (buf, &map);
+  }
 
   if (G_UNLIKELY (ret != GST_FLOW_OK)) {
     GST_DEBUG_OBJECT (dec, "flow: %s", gst_flow_get_name (ret));

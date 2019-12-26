@@ -1226,6 +1226,7 @@ gst_v4l2_allocator_qbuf (GstV4l2Allocator * allocator,
   GstV4l2Object *obj = allocator->obj;
   gboolean ret = TRUE;
   gint i;
+  gint64 start = 0, end = 0;
 
   g_return_val_if_fail (g_atomic_int_get (&allocator->active), FALSE);
 
@@ -1241,6 +1242,8 @@ gst_v4l2_allocator_qbuf (GstV4l2Allocator * allocator,
   /* Ensure the memory will stay around and is RO */
   for (i = 0; i < group->n_mem; i++)
     gst_memory_ref (group->mem[i]);
+
+  start = g_get_monotonic_time ();
 
   if (obj->ioctl (obj->video_fd, VIDIOC_QBUF, &group->buffer) < 0) {
     GST_ERROR_OBJECT (allocator, "failed queueing buffer %i: %s",
@@ -1258,6 +1261,11 @@ gst_v4l2_allocator_qbuf (GstV4l2Allocator * allocator,
     }
     goto done;
   }
+
+  end = g_get_monotonic_time ();
+  GST_TRACE_OBJECT (allocator,
+      "log=VIDIOC_QBUF, term=%lld, time=%lld",
+      end - start, g_get_monotonic_time ());
 
   GST_LOG_OBJECT (allocator, "queued buffer %i (flags 0x%X)",
       group->buffer.index, group->buffer.flags);
@@ -1280,6 +1288,7 @@ gst_v4l2_allocator_dqbuf (GstV4l2Allocator * allocator,
   struct v4l2_buffer buffer = { 0 };
   struct v4l2_plane planes[VIDEO_MAX_PLANES] = { {0} };
   gint i;
+  gint64 start = 0, end = 0;
 
   GstV4l2MemoryGroup *group = NULL;
 
@@ -1293,8 +1302,15 @@ gst_v4l2_allocator_dqbuf (GstV4l2Allocator * allocator,
     buffer.m.planes = planes;
   }
 
+  start = g_get_monotonic_time ();
+
   if (obj->ioctl (obj->video_fd, VIDIOC_DQBUF, &buffer) < 0)
     goto error;
+
+  end = g_get_monotonic_time ();
+  GST_TRACE_OBJECT (allocator,
+      "log=VIDIOC_DQBUF, term=%lld, time=%lld",
+      end - start, g_get_monotonic_time ());
 
   group = allocator->groups[buffer.index];
 

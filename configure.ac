@@ -395,6 +395,7 @@ AG_GST_CHECK_PLUGIN(id3demux)
 AG_GST_CHECK_PLUGIN(imagefreeze)
 AG_GST_CHECK_PLUGIN(interleave)
 AG_GST_CHECK_PLUGIN(isomp4)
+AG_GST_CHECK_PLUGIN(isomp4_1_8)
 AG_GST_CHECK_PLUGIN(law)
 AG_GST_CHECK_PLUGIN(level)
 AG_GST_CHECK_PLUGIN(matroska)
@@ -559,6 +560,18 @@ AG_GST_CHECK_FEATURE(GST_V4L2, [Video 4 Linux 2], video4linux2, [
      AC_MSG_WARN([video4linux2 was not found])
   fi
 ])
+
+HAVE_LINUX_EXT=no
+if test x$HAVE_GST_V4L2 = xyes; then
+  AC_CHECK_HEADER(linux/v4l2-ext/videodev2-ext.h, [ HAVE_LINUX_EXT=yes ],
+    [ HAVE_LINUX_EXT=no ])
+  if test x$HAVE_LINUX_EXT = xyes; then
+    AC_DEFINE(HAVE_LINUX_EXT, 1, [Define if linuxtv-ext-header is available])
+    AM_CONDITIONAL(USE_LINUX_EXT, true)
+  else
+    AM_CONDITIONAL(USE_LINUX_EXT, false)
+  fi
+fi
 
 # Optional gudev for device probing
 AC_ARG_WITH([gudev],
@@ -1238,6 +1251,7 @@ gst/icydemux/Makefile
 gst/imagefreeze/Makefile
 gst/interleave/Makefile
 gst/isomp4/Makefile
+gst/isomp4_1_8/Makefile
 gst/law/Makefile
 gst/level/Makefile
 gst/matroska/Makefile

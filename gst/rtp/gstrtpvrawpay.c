@@ -142,6 +142,7 @@ gst_rtp_vraw_pay_setcaps (GstRTPBasePayload * payload, GstCaps * caps)
 
   rtpvrawpay = GST_RTP_VRAW_PAY (payload);
 
+  gst_video_info_init (&info);
   if (!gst_video_info_from_caps (&info, caps))
     goto invalid_caps;
 

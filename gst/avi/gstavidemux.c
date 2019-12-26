@@ -45,6 +45,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "gst/riff/riff-media.h"
 #include "gstavidemux.h"
@@ -53,16 +54,43 @@
 #include <gst/base/gstadapter.h>
 #include <gst/tag/tag.h>
 
+#define GST_IS_SUBTITLE_STREAM(e) (((e)->name != NULL && strstr ((e)->name, "Subtitle")) || \
+        ((e)->strf.vids->compression == GST_RIFF_DXSA ||(e)->strf.vids->compression == GST_RIFF_DXSB))
+
 #define DIV_ROUND_UP(s,v) (((s) + ((v)-1)) / (v))
 
+#define GST_AVI_MAJOR_KEYFRAME ((1 << 1) | (1 << 0))
+#define ENTRY_IS_MAJOR_KEYFRAME(e) ((e)->flags == GST_AVI_MAJOR_KEYFRAME)
+#define ENTRY_SET_MAJOR_KEYFRAME(e) ((e)->flags = GST_AVI_MAJOR_KEYFRAME)
+
 #define GST_AVI_KEYFRAME (1 << 0)
-#define ENTRY_IS_KEYFRAME(e) ((e)->flags == GST_AVI_KEYFRAME)
+#define ENTRY_IS_KEYFRAME(e) ((e)->flags == GST_AVI_KEYFRAME || (e)->flags == GST_AVI_MAJOR_KEYFRAME)
 #define ENTRY_SET_KEYFRAME(e) ((e)->flags = GST_AVI_KEYFRAME)
 #define ENTRY_UNSET_KEYFRAME(e) ((e)->flags = 0)
+#define GST_GET_MP3_FRAMESYNC(e) (e >> 21)
+#define GST_GET_MP3_VERSION(e) ((e >> 19) & 0x03)
+#define GST_MP3_FRAMESYNC (0xFFFFFFFF >> 21)
+#define GST_MP3_VERSION1 3
+#define GST_MP3_VERSION2 2
+#define GST_FIRST_STREAM 0
+#define GST_MP3_FOURCC 0x55
 
+#define GST_AVI_FOURCC_LENGTH 4
+#define GST_AVI_CHUNK_HEADER_LENGTH 8
 
 GST_DEBUG_CATEGORY_STATIC (avidemux_debug);
 #define GST_CAT_DEFAULT avidemux_debug
+
+/*For Push based Trick mode*/
+#ifdef AVI_PUSHMODE_TRICK
+static gboolean gst_avi_demux_handle_trick (GstAviDemux * avi, gint64 cur);
+#endif
+
+enum
+{
+  PROP_0,
+  PROP_THUMBNAIL_MODE
+};
 
 static GstStaticPadTemplate sink_templ = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
@@ -81,18 +109,13 @@ static void gst_avi_demux_finalize (GObject * object);
 
 static void gst_avi_demux_reset (GstAviDemux * avi);
 
-#if 0
-static const GstEventMask *gst_avi_demux_get_event_mask (GstPad * pad);
-#endif
 static gboolean gst_avi_demux_handle_src_event (GstPad * pad,
     GstObject * parent, GstEvent * event);
 static gboolean gst_avi_demux_handle_sink_event (GstPad * pad,
     GstObject * parent, GstEvent * event);
 static gboolean gst_avi_demux_push_event (GstAviDemux * avi, GstEvent * event);
+static gboolean gst_avi_demux_push_gap_audio (GstAviDemux * avi);
 
-#if 0
-static const GstFormat *gst_avi_demux_get_src_formats (GstPad * pad);
-#endif
 static gboolean gst_avi_demux_handle_src_query (GstPad * pad,
     GstObject * parent, GstQuery * query);
 static gboolean gst_avi_demux_src_convert (GstPad * pad, GstFormat src_format,
@@ -111,10 +134,6 @@ static gboolean gst_avi_demux_sink_activate_mode (GstPad * sinkpad,
     GstObject * parent, GstPadMode mode, gboolean active);
 static GstFlowReturn gst_avi_demux_chain (GstPad * pad, GstObject * parent,
     GstBuffer * buf);
-#if 0
-static void gst_avi_demux_set_index (GstElement * element, GstIndex * index);
-static GstIndex *gst_avi_demux_get_index (GstElement * element);
-#endif
 static GstStateChangeReturn gst_avi_demux_change_state (GstElement * element,
     GstStateChange transition);
 static void gst_avi_demux_calculate_durations_from_index (GstAviDemux * avi);
@@ -127,6 +146,13 @@ static void gst_avi_demux_parse_strd (GstAviDemux * avi, GstBuffer * buf);
 
 static void parse_tag_value (GstAviDemux * avi, GstTagList * taglist,
     const gchar * type, guint8 * ptr, guint tsize);
+static void gst_avi_demux_parse_mpegaudio (GstAviDemux * avi);
+static void gst_avi_demux_set_major_index (GstAviDemux * avi,
+    GstAviStream * stream);
+
+static GstBuffer *gst_avi_demux_invert (GstAviStream * stream, GstBuffer * buf);
+
+static gboolean gst_avi_demux_check_divx (guint32 fourcc);
 
 /* GObject methods */
 
@@ -148,10 +174,6 @@ gst_avi_demux_class_init (GstAviDemuxClass * klass)
 
   gstelement_class->change_state =
       GST_DEBUG_FUNCPTR (gst_avi_demux_change_state);
-#if 0
-  gstelement_class->set_index = GST_DEBUG_FUNCPTR (gst_avi_demux_set_index);
-  gstelement_class->get_index = GST_DEBUG_FUNCPTR (gst_avi_demux_get_index);
-#endif
 
   audcaps = gst_riff_create_audio_template_caps ();
   gst_caps_append (audcaps, gst_caps_new_empty_simple ("audio/x-avi-unknown"));
@@ -274,19 +296,19 @@ gst_avi_demux_reset (GstAviDemux * avi)
   avi->have_group_id = FALSE;
   avi->group_id = G_MAXUINT;
 
+  /*thumbnail_mode */
+  avi->thumbnail_mode = FALSE;
+  avi->isInterleaved = FALSE;
+  avi->isNotSupportCodec = FALSE;
+
   avi->state = GST_AVI_DEMUX_START;
   avi->offset = 0;
   avi->building_index = FALSE;
+  avi->is_flushing = FALSE;
 
   avi->index_offset = 0;
   g_free (avi->avih);
   avi->avih = NULL;
-
-#if 0
-  if (avi->element_index)
-    gst_object_unref (avi->element_index);
-  avi->element_index = NULL;
-#endif
 
   if (avi->seg_event) {
     gst_event_unref (avi->seg_event);
@@ -305,37 +327,17 @@ gst_avi_demux_reset (GstAviDemux * avi)
   avi->have_eos = FALSE;
   avi->seekable = TRUE;
 
+#ifdef AVI_PUSHMODE_TRICK
+  avi->pushed_Iframe = FALSE;
+  avi->pushed_Audio = FALSE;
+  avi->all_audio_pushed = FALSE;
+#endif
+
   gst_adapter_clear (avi->adapter);
 
   gst_segment_init (&avi->segment, GST_FORMAT_TIME);
   avi->segment_seqnum = 0;
 }
-
-
-/* GstElement methods */
-
-#if 0
-static const GstFormat *
-gst_avi_demux_get_src_formats (GstPad * pad)
-{
-  GstAviStream *stream = gst_pad_get_element_private (pad);
-
-  static const GstFormat src_a_formats[] = {
-    GST_FORMAT_TIME,
-    GST_FORMAT_BYTES,
-    GST_FORMAT_DEFAULT,
-    0
-  };
-  static const GstFormat src_v_formats[] = {
-    GST_FORMAT_TIME,
-    GST_FORMAT_DEFAULT,
-    0
-  };
-
-  return (stream->strh->type == GST_RIFF_FCC_auds ?
-      src_a_formats : src_v_formats);
-}
-#endif
 
 /* assumes stream->strf.auds->av_bps != 0 */
 static inline GstClockTime
@@ -529,9 +531,13 @@ gst_avi_demux_handle_src_query (GstPad * pad, GstObject * parent,
       }
 
       /* take stream duration, fall back to avih duration */
-      if ((duration = stream->duration) == -1)
-        if ((duration = stream->hdr_duration) == -1)
+      if ((duration = stream->duration) == -1) {
+        if (GST_CLOCK_TIME_IS_VALID (stream->hdr_duration)
+            && stream->hdr_duration > avi->duration) {
+          duration = stream->hdr_duration;
+        } else
           duration = avi->duration;
+      }
 
       gst_query_parse_duration (query, &fmt, NULL);
 
@@ -557,6 +563,22 @@ gst_avi_demux_handle_src_query (GstPad * pad, GstObject * parent,
           break;
       }
       break;
+    }
+    case GST_QUERY_CUSTOM:{
+      gboolean trickable = TRUE;
+      GstStructure *s;
+
+      s = (GstStructure *) gst_query_get_structure (query);
+
+      if (gst_structure_has_name (s, "custom-trickable")) {
+
+        gst_structure_set (s, "trickable", G_TYPE_BOOLEAN, trickable, NULL);
+        res = TRUE;
+        break;
+      } else {
+        res = gst_pad_query_default (pad, parent, query);
+        break;
+      }
     }
     case GST_QUERY_SEEKING:{
       GstFormat fmt;
@@ -613,67 +635,6 @@ gst_avi_demux_handle_src_query (GstPad * pad, GstObject * parent,
 
   return res;
 }
-
-#if 0
-static const GstEventMask *
-gst_avi_demux_get_event_mask (GstPad * pad)
-{
-  static const GstEventMask masks[] = {
-    {GST_EVENT_SEEK, GST_SEEK_METHOD_SET | GST_SEEK_FLAG_KEY_UNIT},
-    {0,}
-  };
-
-  return masks;
-}
-#endif
-
-#if 0
-static guint64
-gst_avi_demux_seek_streams (GstAviDemux * avi, guint64 offset, gboolean before)
-{
-  GstAviStream *stream;
-  GstIndexEntry *entry;
-  gint i;
-  gint64 val, min = offset;
-
-  for (i = 0; i < avi->num_streams; i++) {
-    stream = &avi->stream[i];
-
-    entry = gst_index_get_assoc_entry (avi->element_index, stream->index_id,
-        before ? GST_INDEX_LOOKUP_BEFORE : GST_INDEX_LOOKUP_AFTER,
-        GST_ASSOCIATION_FLAG_NONE, GST_FORMAT_BYTES, offset);
-
-    if (before) {
-      if (entry) {
-        gst_index_entry_assoc_map (entry, GST_FORMAT_BYTES, &val);
-        GST_DEBUG_OBJECT (avi, "stream %d, previous entry at %"
-            G_GUINT64_FORMAT, i, val);
-        if (val < min)
-          min = val;
-      }
-      continue;
-    }
-
-    if (!entry) {
-      GST_DEBUG_OBJECT (avi, "no position for stream %d, assuming at start", i);
-      stream->current_entry = 0;
-      stream->current_total = 0;
-      continue;
-    }
-
-    gst_index_entry_assoc_map (entry, GST_FORMAT_BYTES, &val);
-    GST_DEBUG_OBJECT (avi, "stream %d, next entry at %" G_GUINT64_FORMAT,
-        i, val);
-
-    gst_index_entry_assoc_map (entry, GST_FORMAT_TIME, &val);
-    stream->current_total = val;
-    gst_index_entry_assoc_map (entry, GST_FORMAT_DEFAULT, &val);
-    stream->current_entry = val;
-  }
-
-  return min;
-}
-#endif
 
 static gint
 gst_avi_demux_index_entry_offset_search (GstAviIndexEntry * entry,
@@ -758,6 +719,9 @@ gst_avi_demux_handle_sink_event (GstPad * pad, GstObject * parent,
       gint64 boffset, offset = 0;
       GstSegment segment;
       GstEvent *segment_event;
+#ifdef AVI_PUSHMODE_TRICK
+      avi->segment_event_recvd = TRUE;
+#endif
 
       /* some debug output */
       gst_event_copy_segment (event, &segment);
@@ -819,25 +783,6 @@ gst_avi_demux_handle_sink_event (GstPad * pad, GstObject * parent,
         /* get the ts corresponding to start offset bytes for the stream */
         gst_avi_demux_get_buffer_info (avi, stream, index,
             (GstClockTime *) & segment.time, NULL, NULL, NULL);
-#if 0
-      } else if (avi->element_index) {
-        GstIndexEntry *entry;
-
-        /* Let's check if we have an index entry for this position */
-        entry = gst_index_get_assoc_entry (avi->element_index, avi->index_id,
-            GST_INDEX_LOOKUP_AFTER, GST_ASSOCIATION_FLAG_NONE,
-            GST_FORMAT_BYTES, segment.start);
-
-        /* we can not go where we have not yet been before ... */
-        if (!entry) {
-          GST_WARNING_OBJECT (avi, "insufficient index data, forcing EOS");
-          goto eos;
-        }
-
-        gst_index_entry_assoc_map (entry, GST_FORMAT_TIME,
-            (gint64 *) & segment.time);
-        gst_index_entry_assoc_map (entry, GST_FORMAT_BYTES, &offset);
-#endif
       } else {
         GST_WARNING_OBJECT (avi, "no index data, forcing EOS");
         goto eos;
@@ -851,25 +796,46 @@ gst_avi_demux_handle_sink_event (GstPad * pad, GstObject * parent,
       /* rescue duration */
       segment.duration = avi->segment.duration;
 
+#ifdef AVI_PUSHMODE_TRICK
+      if (avi->streaming) {
+        segment.rate = avi->demux_rate;
+        avi->segment.rate = avi->demux_rate;
+        if (avi->demux_rate < 0.0) {
+          segment.stop = segment.start;
+          segment.start = 0;
+          segment.position = segment.stop;
+          segment.time = segment.start;
+        }
+      }
+#endif
+
+
       /* set up segment and send downstream */
       gst_segment_copy_into (&segment, &avi->segment);
 
-      GST_DEBUG_OBJECT (avi, "Pushing newseg %" GST_SEGMENT_FORMAT, &segment);
-      avi->segment_seqnum = gst_event_get_seqnum (event);
-      segment_event = gst_event_new_segment (&segment);
-      gst_event_set_seqnum (segment_event, gst_event_get_seqnum (event));
-      gst_avi_demux_push_event (avi, segment_event);
-
+#ifdef AVI_PUSHMODE_TRICK
+      if (avi->rate_changed) {
+#endif
+        GST_DEBUG_OBJECT (avi, "Pushing newseg %" GST_SEGMENT_FORMAT, &segment);
+        avi->segment_seqnum = gst_event_get_seqnum (event);
+        segment_event = gst_event_new_segment (&segment);
+        gst_event_set_seqnum (segment_event, gst_event_get_seqnum (event));
+        gst_avi_demux_push_event (avi, segment_event);
+        /* Push gap event to downstream element if we do not need audio */
+        if (avi->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS ||
+            avi->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_NO_AUDIO) {
+          GST_DEBUG_OBJECT (avi, "Pushing GAP for no audio !!");
+          gst_avi_demux_push_gap_audio (avi);
+        }
+#ifdef AVI_PUSHMODE_TRICK
+      }
+#endif
       GST_DEBUG_OBJECT (avi, "next chunk expected at %" G_GINT64_FORMAT,
           boffset);
 
       /* adjust state for streaming thread accordingly */
       if (avi->have_index)
         gst_avi_demux_seek_streams_index (avi, offset, FALSE);
-#if 0
-      else
-        gst_avi_demux_seek_streams (avi, offset, FALSE);
-#endif
 
       /* set up streaming thread */
       g_assert (offset >= boffset);
@@ -897,16 +863,56 @@ gst_avi_demux_handle_sink_event (GstPad * pad, GstObject * parent,
       }
       break;
     }
+
+#ifdef AVI_PUSHMODE_TRICK
+    case GST_EVENT_FLUSH_START:
+
+      avi->demux_rate = avi->segment.rate;
+      avi->segment_event_recvd = FALSE;
+
+      if (((avi->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS)
+              || avi->segment.rate == 0.5) && !avi->rate_changed
+          && avi->streaming) {
+        gst_event_unref (event);
+        res = TRUE;
+        return res;
+      } else {
+        gst_avi_demux_push_event (avi, event);
+        avi->is_flushing = TRUE;
+        res = TRUE;
+      }
+      break;
+#endif
+
+
     case GST_EVENT_FLUSH_STOP:
     {
       gint i;
-
       gst_adapter_clear (avi->adapter);
       avi->have_eos = FALSE;
       for (i = 0; i < avi->num_streams; i++) {
         avi->stream[i].discont = TRUE;
       }
-      /* fall through to default case so that the event gets passed downstream */
+
+#ifdef AVI_PUSHMODE_TRICK
+      if (((avi->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS)
+              || avi->segment.rate == 0.5) && (!avi->rate_changed)
+          && (avi->streaming)) {
+        gst_event_unref (event);
+        return TRUE;
+      } else
+#endif
+      {
+
+        if (avi->streaming && !avi->have_index)
+          avi->state = GST_AVI_DEMUX_SEEK;
+
+        /* fall through to default case so that the event gets passed downstream */
+        gst_avi_demux_push_event (avi, event);
+        res = TRUE;
+      }
+      avi->is_flushing = FALSE;
+      break;
     }
     default:
       res = gst_pad_event_default (pad, parent, event);
@@ -1199,6 +1205,10 @@ gst_avi_demux_parse_avih (GstAviDemux * avi,
   else
     avi->duration = GST_CLOCK_TIME_NONE;
 
+  if (avih->flags & GST_RIFF_AVIH_ISINTERLEAVED || avih->streams == 1)
+    avi->isInterleaved = TRUE;
+
+  GST_INFO_OBJECT (avi, " isInterleaved     %d", avi->isInterleaved);
   GST_INFO_OBJECT (avi, " header duration  %" GST_TIME_FORMAT,
       GST_TIME_ARGS (avi->duration));
 
@@ -1331,9 +1341,10 @@ gst_avi_demux_add_index (GstAviDemux * avi, GstAviStream * stream,
     if (idx_max == 0) {
       /* initial size guess, assume each stream has an equal amount of entries,
        * overshoot with at least 8K */
-      idx_max = (num / avi->num_streams) + (8192 / sizeof (GstAviIndexEntry));
+      idx_max =
+          (num / avi->num_streams) + (8192 * 100 / sizeof (GstAviIndexEntry));
     } else {
-      idx_max += 8192 / sizeof (GstAviIndexEntry);
+      idx_max += 8192 * 100 / sizeof (GstAviIndexEntry);
       GST_DEBUG_OBJECT (avi, "expanded index from %u to %u",
           stream->idx_max, idx_max);
     }
@@ -1396,25 +1407,12 @@ gst_avi_demux_get_buffer_info (GstAviDemux * avi, GstAviStream * stream,
 
   if (stream->is_vbr) {
     /* VBR stream next timestamp */
-    if (stream->strh->type == GST_RIFF_FCC_auds) {
-      if (timestamp)
-        *timestamp =
-            avi_stream_convert_frames_to_time_unchecked (stream, entry->total);
-      if (ts_end) {
-        gint size = 1;
-        if (G_LIKELY (entry_n + 1 < stream->idx_n))
-          size = stream->index[entry_n + 1].total - entry->total;
-        *ts_end = avi_stream_convert_frames_to_time_unchecked (stream,
-            entry->total + size);
-      }
-    } else {
-      if (timestamp)
-        *timestamp =
-            avi_stream_convert_frames_to_time_unchecked (stream, entry_n);
-      if (ts_end)
-        *ts_end = avi_stream_convert_frames_to_time_unchecked (stream,
-            entry_n + 1);
-    }
+    if (timestamp)
+      *timestamp =
+          avi_stream_convert_frames_to_time_unchecked (stream, entry_n);
+    if (ts_end)
+      *ts_end = avi_stream_convert_frames_to_time_unchecked (stream,
+          entry_n + 1);
   } else if (stream->strh->type == GST_RIFF_FCC_auds) {
     /* constant rate stream */
     if (timestamp)
@@ -1473,6 +1471,22 @@ gst_avi_demux_do_index_stats (GstAviDemux * avi)
 #ifndef GST_DISABLE_GST_DEBUG
     total_max += stream->idx_max;
 #endif
+    if (avi->streaming && stream->strh->type == GST_RIFF_FCC_auds) {
+      GstAviStream *main_stream = &avi->stream[avi->main_stream];
+      guint64 video_lastOffset = 0, audio_firstOffset = 0;
+
+      video_lastOffset = main_stream->index[main_stream->idx_n - 1].offset;
+      audio_firstOffset = stream->index[0].offset;
+
+      if (video_lastOffset < audio_firstOffset && video_lastOffset > (1 << 24))
+        avi->isInterleaved = FALSE;
+      else
+        avi->isInterleaved = TRUE;
+    }
+
+    if (stream->strh->type == GST_RIFF_FCC_vids)
+      gst_avi_demux_set_major_index (avi, stream);
+
     GST_INFO_OBJECT (avi, "Stream %d, dur %" GST_TIME_FORMAT ", %6u entries, "
         "%5u keyframes, entry size = %2u, total size = %10u, allocated %10u",
         i, GST_TIME_ARGS (stream->idx_duration), stream->idx_n,
@@ -1586,9 +1600,13 @@ gst_avi_demux_parse_subindex (GstAviDemux * avi, GstAviStream * stream,
     }
     entry.size &= ~0x80000000;
 
+    /* initialize total */
+    entry.total = 0;
+
     /* and add */
     if (G_UNLIKELY (!gst_avi_demux_add_index (avi, stream, num, &entry)))
       goto out_of_mem;
+
   }
 done:
   gst_buffer_unmap (buf, &map);
@@ -1630,6 +1648,40 @@ out_of_mem:
 }
 
 /*
+ * Set Major keyframe flag for FFx16
+ */
+static void
+gst_avi_demux_set_major_index (GstAviDemux * avi, GstAviStream * stream)
+{
+  guint32 num, i;
+
+  num = stream->idx_n;
+
+  if (GST_IS_SUBTITLE_STREAM (stream)
+      || stream->strh->type != GST_RIFF_FCC_vids)
+    return;
+
+  if (num / stream->n_keyframes < 10) {
+    gboolean isKeyframe = FALSE;
+
+    GST_WARNING_OBJECT (avi, "too many keyframe total entry %d, keyframes %d",
+        num, stream->n_keyframes);
+
+    stream->isHeavyIndex = TRUE;
+
+    for (i = 0; i < num; i++) {
+      if (ENTRY_IS_KEYFRAME (&stream->index[i])) {
+        if (!isKeyframe) {
+          ENTRY_SET_MAJOR_KEYFRAME (&stream->index[i]);
+          isKeyframe = TRUE;
+        } else
+          isKeyframe = FALSE;
+      }
+    }
+  }
+}
+
+/*
  * Create and push a flushing seek event upstream
  */
 static gboolean
@@ -1637,13 +1689,24 @@ perform_seek_to_offset (GstAviDemux * demux, guint64 offset, guint32 seqnum)
 {
   GstEvent *event;
   gboolean res = 0;
+  GstSeekFlags flags = 0;
+
+  if (demux->is_flushing) {
+    GST_WARNING_OBJECT (demux, "In flushing state. SKIP this seek event");
+    return TRUE;
+  }
 
   GST_DEBUG_OBJECT (demux, "Seeking to %" G_GUINT64_FORMAT, offset);
 
+  if (demux->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS)
+    flags |= GST_SEEK_FLAG_TRICKMODE_KEY_UNITS;
+  if (demux->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_NO_AUDIO)
+    flags |= GST_SEEK_FLAG_TRICKMODE_NO_AUDIO;
+
   event =
       gst_event_new_seek (1.0, GST_FORMAT_BYTES,
-      GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE, GST_SEEK_TYPE_SET, offset,
-      GST_SEEK_TYPE_NONE, -1);
+      GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_SKIP | flags, GST_SEEK_TYPE_SET,
+      offset, GST_SEEK_TYPE_NONE, -1);
   gst_event_set_seqnum (event, seqnum);
   res = gst_pad_push_event (demux->sinkpad, event);
 
@@ -1667,19 +1730,20 @@ gst_avi_demux_read_subindexes_push (GstAviDemux * avi)
   if (avi->odml_subidxs[avi->odml_subidx] != avi->offset)
     return FALSE;
 
-  if (!gst_avi_demux_peek_chunk (avi, &tag, &size))
-    return TRUE;
-
   /* this is the ODML chunk we expect */
   odml_stream = avi->odml_stream;
 
-  if ((tag != GST_MAKE_FOURCC ('i', 'x', '0' + odml_stream / 10,
-              '0' + odml_stream % 10)) &&
-      (tag != GST_MAKE_FOURCC ('0' + odml_stream / 10,
-              '0' + odml_stream % 10, 'i', 'x'))) {
-    GST_WARNING_OBJECT (avi, "Not an ix## chunk (%" GST_FOURCC_FORMAT ")",
-        GST_FOURCC_ARGS (tag));
-    return FALSE;
+  if (!gst_avi_demux_peek_chunk (avi, &tag, &size)) {
+    if ((tag == GST_MAKE_FOURCC ('i', 'x', '0' + odml_stream / 10,
+                '0' + odml_stream % 10)) ||
+        (tag == GST_MAKE_FOURCC ('0' + odml_stream / 10,
+                '0' + odml_stream % 10, 'i', 'x')))
+      return TRUE;
+    else {
+      GST_WARNING_OBJECT (avi, "Not an ix## chunk (%" GST_FOURCC_FORMAT ")",
+          GST_FOURCC_ARGS (tag));
+      return FALSE;
+    }
   }
 
   avi->offset += 8 + GST_ROUND_UP_2 (size);
@@ -1898,15 +1962,12 @@ gst_avi_demux_expose_streams (GstAviDemux * avi, gboolean force)
       gst_element_add_pad ((GstElement *) avi, stream->pad);
       gst_flow_combiner_add_pad (avi->flowcombiner, stream->pad);
 
-#if 0
-      if (avi->element_index)
-        gst_index_get_writer_id (avi->element_index,
-            GST_OBJECT_CAST (stream->pad), &stream->index_id);
-#endif
-
       stream->exposed = TRUE;
-      if (avi->main_stream == -1)
+      if (avi->main_stream == -1 && stream->strh->type == GST_RIFF_FCC_vids) {
         avi->main_stream = i;
+        GST_INFO_OBJECT (avi, " Main Stream Num : %d ) Name : %s", i,
+            stream->name);
+      }
     } else {
       GST_WARNING_OBJECT (avi, "Stream #%d doesn't have any entry, removing it",
           i);
@@ -1993,6 +2054,9 @@ gst_avi_demux_check_caps (GstAviDemux * avi, GstAviStream * stream,
         /* ... but rather properly parsed bytestream */
         gst_structure_set (s, "stream-format", G_TYPE_STRING, "byte-stream",
             "alignment", G_TYPE_STRING, "au", NULL);
+      } else {
+        gst_structure_set (s, "stream-format", G_TYPE_STRING, "avc",
+            "alignment", G_TYPE_STRING, "au", NULL);
       }
     } else {
       gst_buffer_unmap (buf, &map);
@@ -2035,6 +2099,7 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
   gchar *stream_id;
   GstMapInfo map;
   gboolean sparse = FALSE;
+  guint max_stream = GST_AVI_DEMUX_MAX_STREAMS;
 
   element = GST_ELEMENT_CAST (avi);
 
@@ -2042,10 +2107,12 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
 
   gst_avi_demux_roundup_list (avi, &buf);
 
-  if (avi->num_streams >= GST_AVI_DEMUX_MAX_STREAMS) {
+  if (avi->thumbnail_mode)
+    max_stream = 1;
+
+  if (avi->num_streams >= max_stream) {
     GST_WARNING_OBJECT (avi,
-        "maximum no of streams (%d) exceeded, ignoring stream",
-        GST_AVI_DEMUX_MAX_STREAMS);
+        "maximum no of streams (%d) exceeded, ignoring stream", max_stream);
     gst_buffer_unref (buf);
     /* not a fatal error, let's say */
     return TRUE;
@@ -2099,6 +2166,11 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
                 strh->rate, strh->scale);
           }
         }
+
+        if (stream->strh->type == GST_RIFF_FCC_auds
+            && avi->num_streams == GST_FIRST_STREAM)
+          avi->thumbnail_mode = FALSE;
+
         /* determine duration as indicated by header */
         stream->hdr_duration = gst_util_uint64_scale ((guint64) strh->length *
             strh->scale, GST_SECOND, (guint64) strh->rate);
@@ -2137,9 +2209,20 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
             sub = NULL;
             if (!res)
               break;
+
             stream->is_vbr = (stream->strh->samplesize == 0)
                 && stream->strh->scale > 1
                 && stream->strf.auds->blockalign != 1;
+
+            /*zeldasky 2012-02-04 for exceptional case for AAC */
+            if (!stream->is_vbr && stream->strf.auds->format == 0xFF) {
+              stream->is_vbr = (stream->strh->samplesize == 0 ||
+                  stream->strh->samplesize == 1 ||
+                  stream->strh->samplesize == 1024)
+                  && stream->strh->scale > 1
+                  && stream->strf.auds->blockalign != 1;
+            }
+
             GST_DEBUG_OBJECT (element, "marking audio as VBR:%d, res %d",
                 stream->is_vbr, res);
             /* we need these or we have no way to come up with timestamps */
@@ -2225,6 +2308,7 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
           gst_avi_demux_parse_strd (avi, sub);
           sub = NULL;
         }
+        sub = NULL;
         break;
       case GST_RIFF_TAG_strn:
         g_free (stream->name);
@@ -2243,6 +2327,7 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
         gst_buffer_unmap (sub, &map);
         gst_buffer_unref (sub);
         sub = NULL;
+
         break;
       case GST_RIFF_IDIT:
         gst_avi_demux_parse_idit (avi, sub);
@@ -2290,6 +2375,9 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
     goto fail;
   }
 
+  if (GST_IS_SUBTITLE_STREAM (stream))
+    return FALSE;
+
   /* get class to figure out the template */
   klass = GST_ELEMENT_GET_CLASS (avi);
 
@@ -2298,6 +2386,7 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
   switch (stream->strh->type) {
     case GST_RIFF_FCC_vids:{
       guint32 fourcc;
+      gchar *format = NULL;
 
       fourcc = (stream->strf.vids->compression) ?
           stream->strf.vids->compression : stream->strh->fcc_handler;
@@ -2326,6 +2415,21 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
                 n, d, NULL);
         }
         caps = gst_avi_demux_check_caps (avi, stream, caps);
+
+        if (gst_avi_demux_check_divx (fourcc)) {
+          gst_caps_set_simple (caps, "format", G_TYPE_STRING, "XVID", NULL);
+        } else {
+          format = g_strdup_printf ("%c%c%c%c", GST_FOURCC_ARGS (fourcc));
+          gst_caps_set_simple (caps, "format", G_TYPE_STRING, format, NULL);
+
+          if (strstr (format, "MP42")) {
+            avi->isNotSupportCodec = TRUE;
+          }
+
+          g_free (format);
+        }
+
+
         tag_name = GST_TAG_VIDEO_CODEC;
         avi->num_v_streams++;
       } else {
@@ -2338,12 +2442,23 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
       break;
     }
     case GST_RIFF_FCC_auds:{
+      GstStructure *s;
+
       /* FIXME: Do something with the channel reorder map */
       padname = g_strdup_printf ("audio_%u", avi->num_a_streams);
       templ = gst_element_class_get_pad_template (klass, "audio_%u");
       caps = gst_riff_create_audio_caps (stream->strf.auds->format,
           stream->strh, stream->strf.auds, stream->extradata,
           stream->initdata, &codec_name, NULL);
+
+      s = gst_caps_get_structure (caps, 0);
+
+      if (gst_structure_has_name (s, "audio/x-wma")) {
+        gst_caps_unref (caps);
+        caps = gst_caps_new_simple ("audio/x-avi-unknown", "codec_id",
+            G_TYPE_INT, stream->strf.auds->format, NULL);
+      }
+
       if (!caps) {
         caps = gst_caps_new_simple ("audio/x-avi-unknown", "codec_id",
             G_TYPE_INT, stream->strf.auds->format, NULL);
@@ -2386,6 +2501,12 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
     goto fail;
   }
 
+  /* zeldasky */
+  gst_caps_set_simple (caps, "container", G_TYPE_STRING, "avi", NULL);
+  gst_caps_set_simple (caps, "seekable", G_TYPE_BOOLEAN, avi->seekable, NULL);
+
+  gst_caps_set_simple (caps, "trickable", G_TYPE_BOOLEAN, TRUE, NULL);
+
   GST_DEBUG_OBJECT (element, "codec-name=%s", codec_name ? codec_name : "NULL");
   GST_DEBUG_OBJECT (element, "caps=%" GST_PTR_FORMAT, caps);
 
@@ -2396,21 +2517,10 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
   g_free (padname);
 
   gst_pad_use_fixed_caps (pad);
-#if 0
-  gst_pad_set_formats_function (pad,
-      GST_DEBUG_FUNCPTR (gst_avi_demux_get_src_formats));
-  gst_pad_set_event_mask_function (pad,
-      GST_DEBUG_FUNCPTR (gst_avi_demux_get_event_mask));
-#endif
   gst_pad_set_event_function (pad,
       GST_DEBUG_FUNCPTR (gst_avi_demux_handle_src_event));
   gst_pad_set_query_function (pad,
       GST_DEBUG_FUNCPTR (gst_avi_demux_handle_src_query));
-#if 0
-  gst_pad_set_convert_function (pad,
-      GST_DEBUG_FUNCPTR (gst_avi_demux_src_convert));
-#endif
-
   stream->num = avi->num_streams;
 
   stream->start_entry = 0;
@@ -2428,6 +2538,7 @@ gst_avi_demux_parse_stream (GstAviDemux * avi, GstBuffer * buf)
 
   stream->idx_n = 0;
   stream->idx_max = 0;
+  stream->isHeavyIndex = FALSE;
 
   gst_pad_set_element_private (pad, stream);
   avi->num_streams++;
@@ -2488,7 +2599,6 @@ fail:
     g_free (vprp);
     g_free (codec_name);
     gst_avi_demux_reset_stream (avi, stream);
-    avi->num_streams++;
     return FALSE;
   }
 }
@@ -2662,6 +2772,8 @@ gst_avi_demux_index_for_time (GstAviDemux * avi,
         if (itime < time && index + 1 < stream->idx_n)
           index++;
       }
+      if (index == -1)
+        total = 0;
     }
   } else if (stream->strh->type == GST_RIFF_FCC_auds) {
     /* constant rate stream */
@@ -2799,6 +2911,9 @@ gst_avi_demux_parse_index (GstAviDemux * avi, GstBuffer * buf)
       }
     }
 
+    /* initialize total */
+    entry.total = 0;
+
     /* and add */
     if (G_UNLIKELY (!gst_avi_demux_add_index (avi, stream, num, &entry)))
       goto out_of_mem;
@@ -2867,10 +2982,12 @@ gst_avi_demux_stream_index (GstAviDemux * avi)
   /* check tag first before blindy trying to read 'size' bytes */
   tag = GST_READ_UINT32_LE (map.data);
   size = GST_READ_UINT32_LE (map.data + 4);
-  if (tag == GST_RIFF_TAG_LIST) {
+  if (tag == GST_RIFF_TAG_LIST ||
+      tag == GST_RIFF_TAG_JUNQ || tag == GST_RIFF_TAG_JUNK) {
     /* this is the movi tag */
-    GST_DEBUG_OBJECT (avi, "skip LIST chunk, size %" G_GUINT32_FORMAT,
-        (8 + GST_ROUND_UP_2 (size)));
+    GST_DEBUG_OBJECT (avi,
+        "skip %" GST_FOURCC_FORMAT " chunk, size %" G_GUINT32_FORMAT,
+        GST_FOURCC_ARGS (tag), (8 + GST_ROUND_UP_2 (size)));
     offset += 8 + GST_ROUND_UP_2 (size);
     gst_buffer_unmap (buf, &map);
     gst_buffer_unref (buf);
@@ -3167,6 +3284,15 @@ gst_avi_demux_stream_scan (GstAviDemux * avi)
       goto out_of_mem;
 
   next:
+
+    /*zeldasky 2012-02-21 for exceptionall case */
+    if (((tag & 0xff) == 0x00) && ((((tag) >> 8) & 0xff) == 0x00)
+        && ((((tag) >> 16) & 0xff) == 0x00)) {
+      GST_WARNING_OBJECT (avi,
+          "Stopping index lookup since scan fail. something wrong.");
+      break;
+    }
+
     /* update position */
     pos += GST_ROUND_UP_2 (size);
     if (G_UNLIKELY (pos > length)) {
@@ -3198,6 +3324,7 @@ gst_avi_demux_calculate_durations_from_index (GstAviDemux * avi)
   guint i;
   GstClockTime total;
   GstAviStream *stream;
+  GstAviIndexEntry *entry;
 
   total = GST_CLOCK_TIME_NONE;
 
@@ -3220,6 +3347,20 @@ gst_avi_demux_calculate_durations_from_index (GstAviDemux * avi)
       /* index gave valid duration, use that */
       GST_INFO ("Stream %p duration according to index: %" GST_TIME_FORMAT,
           stream, GST_TIME_ARGS (duration));
+
+      /* [20130729-sangkyu : MP4_DivX5_ADPCM.mp4]
+         some bad case av_bps's information not corrects.
+         In this case, index durations is modified by hduration
+         I don't know why most pcm audio's av_bps was not correct... */
+      if (stream->strh->type == GST_RIFF_FCC_auds && duration < hduration &&
+          (stream->strf.auds->format == 1 || stream->strf.auds->format == 17)) {
+        entry = &stream->index[stream->idx_n - 1];
+        stream->strf.auds->av_bps =
+            (entry->total + entry->size) * GST_SECOND / hduration;
+
+        duration = stream->idx_duration = hduration;
+        GST_ERROR_OBJECT (avi, "Audio-PCM && index-duraion < hduration Case");
+      }
     } else {
       /* fall back to header info to calculate a duration */
       duration = hduration;
@@ -3272,12 +3413,39 @@ gst_avi_demux_push_event (GstAviDemux * avi, GstEvent * event)
   for (i = 0; i < avi->num_streams; i++) {
     GstAviStream *stream = &avi->stream[i];
 
+    if (stream->strh && stream->strh->type == GST_RIFF_FCC_vids
+        && i != avi->main_stream)
+      continue;
+
     if (stream->pad) {
       result = TRUE;
       gst_pad_push_event (stream->pad, gst_event_ref (event));
     }
   }
   gst_event_unref (event);
+  return result;
+}
+
+static gboolean
+gst_avi_demux_push_gap_audio (GstAviDemux * avi)
+{
+  gboolean result = FALSE;
+  gint i;
+
+  GST_DEBUG_OBJECT (avi, "sending GAP event to all audio pads");
+
+  for (i = 0; i < avi->num_streams; i++) {
+    GstAviStream *stream = &avi->stream[i];
+
+    if (stream->strh && stream->strh->type != GST_RIFF_FCC_auds)
+      continue;
+
+    if (stream->pad) {
+      result = TRUE;
+      gst_pad_push_event (stream->pad,
+          gst_event_new_gap (avi->segment.start, GST_CLOCK_TIME_NONE));
+    }
+  }
   return result;
 }
 
@@ -3379,6 +3547,9 @@ gst_avi_demux_stream_header_push (GstAviDemux * avi)
 
         GST_DEBUG_OBJECT (avi, "AVI header ok, reading elemnts from header");
 
+        /* move it for set a flag(seekable, trickable) */
+        gst_avi_demux_check_seekability (avi);
+
         /* now, read the elements from the header until the end */
         while (gst_riff_parse_chunk (GST_ELEMENT_CAST (avi), buf, &offset, &tag,
                 &sub)) {
@@ -3476,6 +3647,7 @@ gst_avi_demux_stream_header_push (GstAviDemux * avi)
         if (tag == GST_RIFF_TAG_LIST) {
           switch (ltag) {
             case GST_RIFF_LIST_movi:
+              gst_avi_demux_parse_mpegaudio (avi);
               gst_adapter_flush (avi->adapter, 12);
               if (!avi->first_movi_offset)
                 avi->first_movi_offset = avi->offset;
@@ -3550,7 +3722,30 @@ skipping_done:
       avi->num_streams, avi->stream[0].indexes);
 
   GST_DEBUG ("Found movi chunk. Starting to stream data");
-  avi->state = GST_AVI_DEMUX_MOVI;
+
+  if (!avi->isInterleaved) {
+    GstEvent *seek_event = NULL;
+    GstPad *seek_pad = NULL;
+
+    seek_event =
+        gst_event_new_seek (1.0, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH,
+        GST_SEEK_TYPE_SET, 0, GST_SEEK_TYPE_NONE, -1);
+
+    GST_INFO_OBJECT (avi, "work a internal seek");
+
+    gst_avi_demux_calculate_durations_from_index (avi);
+
+    gst_avi_demux_expose_streams (avi, TRUE);
+
+    GST_DEBUG_OBJECT (avi, "signaling no more pads");
+    gst_element_no_more_pads (GST_ELEMENT_CAST (avi));
+
+    gst_avi_demux_handle_seek_push (avi, seek_pad, seek_event);
+
+    return GST_FLOW_OK;
+
+  } else
+    avi->state = GST_AVI_DEMUX_MOVI;
 
   /* no indexes in push mode, but it still sets some variables */
   gst_avi_demux_calculate_durations_from_index (avi);
@@ -3567,8 +3762,6 @@ skipping_done:
   avi->seg_event = gst_event_new_segment (&avi->segment);
   if (avi->segment_seqnum)
     gst_event_set_seqnum (avi->seg_event, avi->segment_seqnum);
-
-  gst_avi_demux_check_seekability (avi);
 
   /* at this point we know all the streams and we can signal the no more
    * pads signal */
@@ -4203,6 +4396,7 @@ gst_avi_demux_stream_header_pull (GstAviDemux * avi)
       case GST_RIFF_TAG_LIST:{
         switch (ltag) {
           case GST_RIFF_LIST_movi:
+            gst_avi_demux_parse_mpegaudio (avi);
             GST_DEBUG_OBJECT (avi,
                 "Reached the 'movi' tag, we're done with skipping");
             goto skipping_done;
@@ -4491,17 +4685,23 @@ gst_avi_demux_do_seek (GstAviDemux * avi, GstSegment * segment,
 
   /* FIXME, this code assumes the main stream with keyframes is stream 0,
    * which is mostly correct... */
+
+  /*zeldasky 2012-02-16 for exceptional case */
+  if (avi->main_stream == -1)
+    avi->main_stream = 0;
+
   stream = &avi->stream[avi->main_stream];
 
   next = after && !before;
-  if (segment->rate < 0)
-    next = !next;
 
   /* get the entry index for the requested position */
   index = gst_avi_demux_index_for_time (avi, stream, seek_time, next);
   GST_DEBUG_OBJECT (avi, "Got entry %u", index);
   if (index == -1)
     return FALSE;
+
+  if (index > stream->idx_n)
+    index = 0;
 
   /* check if we are already on a keyframe */
   if (!ENTRY_IS_KEYFRAME (&stream->index[index])) {
@@ -4519,6 +4719,9 @@ gst_avi_demux_do_seek (GstAviDemux * avi, GstSegment * segment,
       GST_DEBUG_OBJECT (avi, "previous keyframe at %u", index);
     }
   }
+
+  if (stream->strh->type == GST_RIFF_FCC_vids && index < 10)
+    index = 0;
 
   /* move the main stream to this position */
   gst_avi_demux_move_stream (avi, stream, segment, index);
@@ -4552,9 +4755,16 @@ gst_avi_demux_do_seek (GstAviDemux * avi, GstSegment * segment,
     if (index == -1)
       continue;
 
-    /* move to previous keyframe */
-    if (!ENTRY_IS_KEYFRAME (&ostream->index[index]))
-      index = gst_avi_demux_index_prev (avi, ostream, index, TRUE);
+    /*zeldasky 2011-11-30 follow seek dirction */
+    if (!ENTRY_IS_KEYFRAME (&ostream->index[index])) {
+      if (segment->rate > 2.0) {
+        GST_INFO_OBJECT (avi, "move to next keyframe");
+        index = gst_avi_demux_index_next (avi, ostream, index, TRUE);
+      } else {
+        GST_INFO_OBJECT (avi, "move to previous keyframe");
+        index = gst_avi_demux_index_prev (avi, ostream, index, TRUE);
+      }
+    }
 
     gst_avi_demux_move_stream (avi, ostream, segment, index);
   }
@@ -4587,6 +4797,9 @@ gst_avi_demux_handle_seek (GstAviDemux * avi, GstPad * pad, GstEvent * event)
     gst_event_parse_seek (event, &rate, &format, &flags,
         &cur_type, &cur, &stop_type, &stop);
     seqnum = gst_event_get_seqnum (event);
+
+    if (rate < -2 && cur == stop)
+      return TRUE;
 
     /* we have to have a format as the segment format. Try to convert
      * if not. */
@@ -4705,6 +4918,103 @@ no_format:
   }
 }
 
+#ifdef AVI_PUSHMODE_TRICK
+static gboolean
+gst_avi_demux_handle_trick (GstAviDemux * avi, gint64 cur)
+{
+  GstAviStream *stream;
+  guint index;
+  guint str_num;
+  guint64 min_offset;
+
+  /* FIXME, this code assumes the main stream with keyframes is stream 0,
+   * which is mostly correct... */
+  str_num = avi->main_stream;
+  stream = &avi->stream[str_num];
+
+  avi->rate_changed = FALSE;
+
+  /* get the entry index for the requested position */
+  index = gst_avi_demux_index_for_time (avi, stream, cur, FALSE);
+
+  if (!ENTRY_IS_KEYFRAME (&stream->index[index])) {
+    avi->segment.rate > 0.0 ? index++ : index--;
+  }
+
+  if (index >= stream->idx_n) {
+    avi->pushed_Iframe = FALSE;
+    avi->pushed_Audio = FALSE;
+    gst_avi_demux_push_event (avi, gst_event_new_eos ());
+    return TRUE;
+  }
+
+  if (index == avi->prev_keyframe_index) {
+    avi->segment.rate > 0.0 ? index++ : index--;
+  }
+
+  avi->prev_keyframe_index = index;
+  GST_DEBUG ("Index found is %d", index);
+
+  GST_DEBUG_OBJECT (avi, "str %u: Found entry %u for %" GST_TIME_FORMAT,
+      str_num, index, GST_TIME_ARGS (cur));
+  if (index == -1)
+    return -1;
+
+  if (avi->segment.rate > 0.0) {
+    GST_DEBUG_OBJECT (avi, "Searching forward for keyframe");
+    /* now go to the next keyframe, this is where we should start
+     * decoding from. */
+    index = gst_avi_demux_index_next (avi, stream, index, TRUE);
+    GST_DEBUG_OBJECT (avi, "Found next keyframe at %u", index);
+  } else {
+    GST_DEBUG_OBJECT (avi, "Searching back for keyframe");
+    /* now go to the previous keyframe, this is where we should start
+     * decoding from. */
+    index = gst_avi_demux_index_prev (avi, stream, index, TRUE);
+    GST_DEBUG_OBJECT (avi, "Found previous keyframe at %u", index);
+
+    if (stream->strh->type == GST_RIFF_FCC_vids && index < 10)
+      index = 0;
+  }
+  if (avi->prev_keyframe_index == index) {
+
+    avi->pushed_Iframe = FALSE;
+    avi->pushed_Audio = FALSE;
+    gst_avi_demux_push_event (avi, gst_event_new_eos ());
+    return TRUE;
+  }
+  if (avi->segment.rate < 0.0 && index == 0) {
+    avi->pushed_Iframe = FALSE;
+    avi->pushed_Audio = FALSE;
+    gst_avi_demux_push_event (avi, gst_event_new_eos ());
+    return TRUE;
+  }
+
+  gst_avi_demux_get_buffer_info (avi, stream, index,
+      &stream->current_timestamp, &stream->current_ts_end,
+      &stream->current_offset, &stream->current_offset_end);
+
+  /* re-use cur to be the timestamp of the seek as it _will_ be */
+  cur = stream->current_timestamp;
+
+  min_offset = stream->index[index].offset;
+  avi->seek_kf_offset = min_offset - 8;
+
+
+  /* index data refers to data, not chunk header (for pull mode convenience) */
+  min_offset -= 8;
+  GST_DEBUG_OBJECT (avi, "seeking to chunk at offset %" G_GUINT64_FORMAT,
+      min_offset);
+
+
+  if (!perform_seek_to_offset (avi, min_offset, avi->segment_seqnum)) {
+    GST_DEBUG_OBJECT (avi, "seek event failed!");
+    return FALSE;
+  }
+  return TRUE;
+}
+#endif
+
 /*
  * Handle seek event in push mode.
  */
@@ -4749,6 +5059,15 @@ avi_demux_handle_seek_push (GstAviDemux * avi, GstPad * pad, GstEvent * event)
 
     format = GST_FORMAT_TIME;
   }
+#ifdef AVI_PUSHMODE_TRICK
+  avi->demux_rate = rate;
+  avi->segment_event_recvd = FALSE;
+  avi->rate_changed = TRUE;
+  avi->segment.rate = rate;
+  avi->pushed_Iframe = FALSE;
+  avi->pushed_Audio = FALSE;
+  avi->all_audio_pushed = FALSE;
+#endif
 
   /* let gst_segment handle any tricky stuff */
   GST_DEBUG_OBJECT (avi, "configuring seek");
@@ -4756,7 +5075,19 @@ avi_demux_handle_seek_push (GstAviDemux * avi, GstPad * pad, GstEvent * event)
   gst_segment_do_seek (&seeksegment, rate, format, flags,
       cur_type, cur, stop_type, stop, &update);
 
-  keyframe = ! !(flags & GST_SEEK_FLAG_KEY_UNIT);
+  if (seeksegment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS) {
+    avi->segment.flags |= GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS;
+  } else {
+    avi->segment.flags &= ~GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS;
+  }
+  if (seeksegment.flags & GST_SEGMENT_FLAG_TRICKMODE_NO_AUDIO) {
+    avi->segment.flags |= GST_SEGMENT_FLAG_TRICKMODE_NO_AUDIO;
+  } else {
+    avi->segment.flags &= ~GST_SEGMENT_FLAG_TRICKMODE_NO_AUDIO;
+  }
+
+  //keyframe = ! !(flags & GST_SEEK_FLAG_KEY_UNIT);
+  keyframe = TRUE;
   cur = seeksegment.position;
   before = ! !(flags & GST_SEEK_FLAG_SNAP_BEFORE);
   after = ! !(flags & GST_SEEK_FLAG_SNAP_AFTER);
@@ -4766,19 +5097,23 @@ avi_demux_handle_seek_push (GstAviDemux * avi, GstPad * pad, GstEvent * event)
       ", kf %u, %s, rate %lf", GST_TIME_ARGS (cur), GST_TIME_ARGS (stop),
       keyframe, snap_types[before ? 1 : 0][after ? 1 : 0], rate);
 
-  if (rate < 0) {
-    GST_DEBUG_OBJECT (avi, "negative rate seek not supported in push mode");
-    return FALSE;
-  }
+
 
   /* FIXME, this code assumes the main stream with keyframes is stream 0,
    * which is mostly correct... */
   str_num = avi->main_stream;
   stream = &avi->stream[str_num];
 
-  next = after && !before;
-  if (seeksegment.rate < 0)
-    next = !next;
+  if (!avi->streaming) {
+    next = after && !before;
+    if (seeksegment.rate < 0)
+      next = !next;
+  } else {
+    if (avi->segment.rate > 2.0)
+      next = TRUE;
+    else
+      next = FALSE;
+  }
 
   /* get the entry index for the requested position */
   index = gst_avi_demux_index_for_time (avi, stream, cur, next);
@@ -4794,7 +5129,7 @@ avi_demux_handle_seek_push (GstAviDemux * avi, GstPad * pad, GstEvent * event)
       /* now go to the next keyframe, this is where we should start
        * decoding from. */
       index = gst_avi_demux_index_next (avi, stream, index, TRUE);
-      GST_DEBUG_OBJECT (avi, "Found previous keyframe at %u", index);
+      GST_DEBUG_OBJECT (avi, "Found next keyframe at %u", index);
     } else {
       GST_DEBUG_OBJECT (avi, "Entry is not a keyframe - searching back");
       /* now go to the previous keyframe, this is where we should start
@@ -4803,6 +5138,9 @@ avi_demux_handle_seek_push (GstAviDemux * avi, GstPad * pad, GstEvent * event)
       GST_DEBUG_OBJECT (avi, "Found previous keyframe at %u", index);
     }
   }
+
+  if (stream->strh->type == GST_RIFF_FCC_vids && index < 10)
+    index = 0;
 
   gst_avi_demux_get_buffer_info (avi, stream, index,
       &stream->current_timestamp, &stream->current_ts_end,
@@ -4854,7 +5192,7 @@ avi_demux_handle_seek_push (GstAviDemux * avi, GstPad * pad, GstEvent * event)
         &str->current_timestamp, &str->current_ts_end,
         &str->current_offset, &str->current_offset_end);
 
-    if (str->index[idx].offset < min_offset) {
+    if (str->index[idx].offset < min_offset && (seeksegment.rate == 1.0)) {
       min_offset = str->index[idx].offset;
       GST_DEBUG_OBJECT (avi,
           "Found an earlier offset at %" G_GUINT64_FORMAT ", str %u",
@@ -4900,8 +5238,6 @@ gst_avi_demux_handle_seek_push (GstAviDemux * avi, GstPad * pad,
     gboolean building_index;
 
     GST_OBJECT_LOCK (avi);
-    /* handle the seek event in the chain function */
-    avi->state = GST_AVI_DEMUX_SEEK;
 
     /* copy the event */
     if (avi->seek_event)
@@ -5023,29 +5359,6 @@ gst_avi_demux_invert (GstAviStream * stream, GstBuffer * buf)
   return buf;
 }
 
-#if 0
-static void
-gst_avi_demux_add_assoc (GstAviDemux * avi, GstAviStream * stream,
-    GstClockTime timestamp, guint64 offset, gboolean keyframe)
-{
-  /* do not add indefinitely for open-ended streaming */
-  if (G_UNLIKELY (avi->element_index && avi->seekable)) {
-    GST_LOG_OBJECT (avi, "adding association %" GST_TIME_FORMAT "-> %"
-        G_GUINT64_FORMAT, GST_TIME_ARGS (timestamp), offset);
-    gst_index_add_association (avi->element_index, avi->index_id,
-        keyframe ? GST_ASSOCIATION_FLAG_KEY_UNIT :
-        GST_ASSOCIATION_FLAG_DELTA_UNIT, GST_FORMAT_TIME, timestamp,
-        GST_FORMAT_BYTES, offset, NULL);
-    /* current_entry is DEFAULT (frame #) */
-    gst_index_add_association (avi->element_index, stream->index_id,
-        keyframe ? GST_ASSOCIATION_FLAG_KEY_UNIT :
-        GST_ASSOCIATION_FLAG_DELTA_UNIT, GST_FORMAT_TIME, timestamp,
-        GST_FORMAT_BYTES, offset, GST_FORMAT_DEFAULT, stream->current_entry,
-        NULL);
-  }
-}
-#endif
-
 /*
  * Returns the aggregated GstFlowReturn.
  */
@@ -5067,72 +5380,124 @@ gst_avi_demux_advance (GstAviDemux * avi, GstAviStream * stream,
     GstFlowReturn ret)
 {
   guint old_entry, new_entry;
+  guint skip_count = 0;
+  gboolean skip_feeding = FALSE;
+  gboolean keyframe_trick = FALSE;
 
-  old_entry = stream->current_entry;
-  /* move forwards */
-  new_entry = old_entry + 1;
+  if (avi->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS) {
+    keyframe_trick = TRUE;
+    stream->discont = TRUE;
+    if (stream->strh->type == GST_RIFF_FCC_auds) {
+      skip_feeding = TRUE;
+    }
+  } else if (G_UNLIKELY (avi->
+          segment.flags & GST_SEGMENT_FLAG_TRICKMODE_NO_AUDIO)
+      && (stream->strh->type == GST_RIFF_FCC_auds)) {
+    stream->discont = TRUE;
+    skip_feeding = TRUE;
+  }
 
-  /* see if we reached the end */
-  if (new_entry >= stream->stop_entry) {
-    if (avi->segment.rate < 0.0) {
-      if (stream->step_entry == stream->start_entry) {
-        /* we stepped all the way to the start, eos */
-        GST_DEBUG_OBJECT (avi, "reverse reached start %u", stream->start_entry);
+  /*zeldasky 2012-03-07 For exceptional case. Some SOC performance very low and Mjpeg all video is key frame */
+  /* in case of MJPEG, feeding video frame skips when high speed trick play */
+  if (stream->strh != NULL
+      && (stream->strh->fcc_handler == GST_MAKE_FOURCC ('M', 'J', 'P', 'G')
+          || stream->strh->fcc_handler == GST_MAKE_FOURCC ('m', 'j', 'p', 'g'))) {
+    if (keyframe_trick && !skip_feeding)
+      skip_feeding = TRUE;
+  }
+
+  do {
+    skip_count++;
+
+    old_entry = stream->current_entry;
+    /* move forwards */
+    new_entry = old_entry + 1;
+
+    /* see if we reached the end */
+    if (new_entry >= stream->stop_entry) {
+      if (avi->segment.rate < 0.0) {
+        if (stream->step_entry == stream->start_entry) {
+          /* we stepped all the way to the start, eos */
+          GST_DEBUG_OBJECT (avi, "reverse reached start %u",
+              stream->start_entry);
+          goto eos;
+        }
+        /* backwards, stop becomes step, find a new step */
+        stream->stop_entry = stream->step_entry;
+        stream->step_entry = gst_avi_demux_index_prev (avi, stream,
+            stream->stop_entry, TRUE);
+
+        GST_DEBUG_OBJECT (avi,
+            "reverse playback jump: start %u, step %u, stop %u",
+            stream->start_entry, stream->step_entry, stream->stop_entry);
+
+        /* and start from the previous keyframe now */
+        new_entry = stream->step_entry;
+      } else {
+        /* EOS */
+        GST_DEBUG_OBJECT (avi, "forward reached stop %u", stream->stop_entry);
         goto eos;
       }
-      /* backwards, stop becomes step, find a new step */
-      stream->stop_entry = stream->step_entry;
-      stream->step_entry = gst_avi_demux_index_prev (avi, stream,
-          stream->stop_entry, TRUE);
-
-      GST_DEBUG_OBJECT (avi,
-          "reverse playback jump: start %u, step %u, stop %u",
-          stream->start_entry, stream->step_entry, stream->stop_entry);
-
-      /* and start from the previous keyframe now */
-      new_entry = stream->step_entry;
-    } else {
-      /* EOS */
-      GST_DEBUG_OBJECT (avi, "forward reached stop %u", stream->stop_entry);
-      goto eos;
     }
-  }
 
-  if (new_entry != old_entry) {
-    stream->current_entry = new_entry;
-    stream->current_total = stream->index[new_entry].total;
+    if (new_entry != old_entry) {
+      stream->current_entry = new_entry;
+      stream->current_total = stream->index[new_entry].total;
 
-    if (new_entry == old_entry + 1) {
-      GST_DEBUG_OBJECT (avi, "moved forwards from %u to %u",
-          old_entry, new_entry);
-      /* we simply moved one step forwards, reuse current info */
-      stream->current_timestamp = stream->current_ts_end;
-      stream->current_offset = stream->current_offset_end;
-      gst_avi_demux_get_buffer_info (avi, stream, new_entry,
-          NULL, &stream->current_ts_end, NULL, &stream->current_offset_end);
-    } else {
-      /* we moved DISCONT, full update */
-      gst_avi_demux_get_buffer_info (avi, stream, new_entry,
-          &stream->current_timestamp, &stream->current_ts_end,
-          &stream->current_offset, &stream->current_offset_end);
-      /* and MARK discont for this stream */
-      stream->discont = TRUE;
-      GST_DEBUG_OBJECT (avi, "Moved from %u to %u, ts %" GST_TIME_FORMAT
-          ", ts_end %" GST_TIME_FORMAT ", off %" G_GUINT64_FORMAT
-          ", off_end %" G_GUINT64_FORMAT, old_entry, new_entry,
-          GST_TIME_ARGS (stream->current_timestamp),
-          GST_TIME_ARGS (stream->current_ts_end), stream->current_offset,
-          stream->current_offset_end);
+      if (new_entry == old_entry + 1) {
+        GST_DEBUG_OBJECT (avi, "moved forwards from %u to %u",
+            old_entry, new_entry);
+        /* we simply moved one step forwards, reuse current info */
+        stream->current_timestamp = stream->current_ts_end;
+        stream->current_offset = stream->current_offset_end;
+        gst_avi_demux_get_buffer_info (avi, stream, new_entry,
+            NULL, &stream->current_ts_end, NULL, &stream->current_offset_end);
+      } else {
+        /* we moved DISCONT, full update */
+        gst_avi_demux_get_buffer_info (avi, stream, new_entry,
+            &stream->current_timestamp, &stream->current_ts_end,
+            &stream->current_offset, &stream->current_offset_end);
+        /* and MARK discont for this stream */
+        stream->discont = TRUE;
+        GST_DEBUG_OBJECT (avi, "Moved from %u to %u, ts %" GST_TIME_FORMAT
+            ", ts_end %" GST_TIME_FORMAT ", off %" G_GUINT64_FORMAT
+            ", off_end %" G_GUINT64_FORMAT, old_entry, new_entry,
+            GST_TIME_ARGS (stream->current_timestamp),
+            GST_TIME_ARGS (stream->current_ts_end), stream->current_offset,
+            stream->current_offset_end);
+      }
     }
-  }
+
+    if (!skip_feeding)
+      return ret;
+
+  } while (skip_count < 17);
+
   return ret;
 
   /* ERROR */
 eos:
   {
-    GST_DEBUG_OBJECT (avi, "we are EOS");
+    GST_DEBUG_OBJECT (avi, "we are EOS : %" GST_FOURCC_FORMAT,
+        GST_FOURCC_ARGS (stream->strh->type));
+
     /* setting current_timestamp to -1 marks EOS */
     stream->current_timestamp = -1;
+    if (stream->pad &&
+        GST_CLOCK_TIME_IS_VALID (stream->idx_duration) &&
+        GST_CLOCK_TIME_IS_VALID (avi->segment.duration)
+        && stream->strh->type == GST_RIFF_FCC_auds
+        && (avi->segment.start + GST_SECOND >= stream->idx_duration)) {
+      guint64 start = stream->idx_duration;
+      guint64 stop = avi->segment.duration;
+      GstEvent *gap = NULL;
+      gap = gst_event_new_gap (start, (stop - start));
+      gst_pad_push_event (stream->pad, gap);
+      GST_INFO_OBJECT (avi,
+          "push gap event stream %d with time :%"
+          GST_TIME_FORMAT " duration: %" GST_TIME_FORMAT, stream->num,
+          GST_TIME_ARGS (start), GST_TIME_ARGS (stop));
+    }
     return GST_FLOW_EOS;
   }
 }
@@ -5214,6 +5579,15 @@ gst_avi_demux_align_buffer (GstAviDemux * demux,
   return buffer;
 }
 
+static inline int
+read_1digit (const unsigned char *buf)
+{
+  if ('0' <= buf[0] && buf[0] <= '9')
+    return buf[0] - '0';
+  else
+    return 0;
+}
+
 static GstFlowReturn
 gst_avi_demux_loop_data (GstAviDemux * avi)
 {
@@ -5221,7 +5595,9 @@ gst_avi_demux_loop_data (GstAviDemux * avi)
   guint stream_num;
   GstAviStream *stream;
   gboolean processed = FALSE;
-  GstBuffer *buf;
+  GstBuffer *buf, *tag_buf;
+  GstMapInfo map;
+  guint32 tag = 0;
   guint64 offset, size;
   GstClockTime timestamp, duration;
   guint64 out_offset, out_offset_end;
@@ -5259,6 +5635,30 @@ gst_avi_demux_loop_data (GstAviDemux * avi)
     size = entry->size;
     keyframe = ENTRY_IS_KEYFRAME (entry);
 
+    if (stream->strh->type == GST_RIFF_FCC_vids) {
+      if (stream->isHeavyIndex && (abs (avi->segment.rate) > 8))
+        keyframe = ENTRY_IS_MAJOR_KEYFRAME (entry);
+    }
+
+    /* for keyframe trick mode */
+    if (avi->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS) {
+      if (stream->strh->type == GST_RIFF_FCC_vids && !keyframe) {
+        GST_DEBUG_OBJECT (avi,
+            "skipping entry caused by keyframe trick mode and video entry :%d or keyframe:%d",
+            stream->current_entry, keyframe);
+        goto next;
+      } else if (stream->strh->type == GST_RIFF_FCC_auds) {
+        GST_LOG_OBJECT (avi, "skipping audio entry %d for keyframe trick mode",
+            stream->current_entry);
+        goto next;
+      }
+    } else if ((avi->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_NO_AUDIO) &&
+        (stream->strh->type == GST_RIFF_FCC_auds)) {
+      GST_LOG_OBJECT (avi, "skipping audio entry %d for no audio trick mode",
+          stream->current_entry);
+      goto next;
+    }
+
     /* skip empty entries */
     if (size == 0) {
       GST_DEBUG_OBJECT (avi, "Skipping entry %u (%" G_GUINT64_FORMAT ", %p)",
@@ -5286,7 +5686,32 @@ gst_avi_demux_loop_data (GstAviDemux * avi)
 
     /* pull in the data */
     buf = NULL;
+    tag_buf = NULL;
+
+    ret =
+        gst_pad_pull_range (avi->sinkpad,
+        offset - GST_AVI_CHUNK_HEADER_LENGTH, GST_AVI_FOURCC_LENGTH, &tag_buf);
+
+    if (ret != GST_FLOW_OK)
+      goto pull_failed;
+
+    gst_buffer_map (tag_buf, &map, GST_MAP_READ);
+    tag = GST_READ_UINT32_LE (map.data);
+
+    if (G_UNLIKELY (tag == 0)) {
+      GST_WARNING_OBJECT (avi, "Invalid tag %d (%" GST_FOURCC_FORMAT ")",
+          stream_num, GST_FOURCC_ARGS (tag));
+      gst_buffer_unmap (tag_buf, &map);
+      gst_buffer_unref (tag_buf);
+      goto next;
+    }
+
+    gst_buffer_unmap (tag_buf, &map);
+    gst_buffer_unref (tag_buf);
+
+    /* pull in the data */
     ret = gst_pad_pull_range (avi->sinkpad, offset, size, &buf);
+
     if (ret != GST_FLOW_OK)
       goto pull_failed;
 
@@ -5303,7 +5728,9 @@ gst_avi_demux_loop_data (GstAviDemux * avi)
       GST_BUFFER_PTS (buf) = timestamp;
     } else {
       GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DELTA_UNIT);
-      GST_BUFFER_PTS (buf) = GST_CLOCK_TIME_NONE;
+      /* 20130721 by zeldasky our vdec needs the pts, despite of not keyframe */
+      //GST_BUFFER_PTS (buf) = GST_CLOCK_TIME_NONE;
+      GST_BUFFER_PTS (buf) = timestamp;
     }
 
     GST_BUFFER_DTS (buf) = timestamp;
@@ -5320,9 +5747,6 @@ gst_avi_demux_loop_data (GstAviDemux * avi)
     } else {
       GST_BUFFER_FLAG_UNSET (buf, GST_BUFFER_FLAG_DISCONT);
     }
-#if 0
-    gst_avi_demux_add_assoc (avi, stream, timestamp, offset, keyframe);
-#endif
 
     /* update current position in the segment */
     avi->segment.position = timestamp;
@@ -5434,6 +5858,13 @@ gst_avi_demux_stream_data (GstAviDemux * avi)
     GST_DEBUG ("Trying chunk (%" GST_FOURCC_FORMAT "), size %d",
         GST_FOURCC_ARGS (tag), size);
 
+    if (G_UNLIKELY (tag == 0)) {
+      GST_WARNING ("Invalid tag %d (%" GST_FOURCC_FORMAT ")",
+          stream_nr, GST_FOURCC_ARGS (tag));
+      GST_ELEMENT_ERROR (avi, STREAM, FAILED, (NULL), ("Illegal stream data"));
+      return GST_FLOW_ERROR;
+    }
+
     if (G_LIKELY ((tag & 0xff) >= '0' && (tag & 0xff) <= '9' &&
             ((tag >> 8) & 0xff) >= '0' && ((tag >> 8) & 0xff) <= '9')) {
       GST_LOG ("Chunk ok");
@@ -5460,6 +5891,7 @@ gst_avi_demux_stream_data (GstAviDemux * avi)
         /* accept 0 size buffer here */
         avi->abort_buffering = FALSE;
         GST_DEBUG ("  skipping %d bytes for now", size);
+        avi->offset += 8 + GST_ROUND_UP_2 (size);
         gst_adapter_flush (avi->adapter, 8 + GST_ROUND_UP_2 (size));
       }
       return GST_FLOW_OK;
@@ -5479,6 +5911,9 @@ gst_avi_demux_stream_data (GstAviDemux * avi)
         avi->abort_buffering = FALSE;
         GST_DEBUG ("  skipping %d bytes for now", size);
         gst_adapter_flush (avi->adapter, 8 + GST_ROUND_UP_2 (size));
+
+        if (size != 0)
+          continue;
       }
       return GST_FLOW_OK;
     } else {
@@ -5516,11 +5951,8 @@ gst_avi_demux_stream_data (GstAviDemux * avi)
       GstAviStream *stream;
       GstClockTime next_ts = 0;
       GstBuffer *buf = NULL;
-#if 0
-      guint64 offset;
-#endif
       gboolean saw_desired_kf = stream_nr != avi->main_stream
-          || avi->offset >= avi->seek_kf_offset;
+          || avi->offset + size >= avi->seek_kf_offset;
 
       if (stream_nr == avi->main_stream && avi->offset == avi->seek_kf_offset) {
         GST_DEBUG_OBJECT (avi, "Desired keyframe reached");
@@ -5543,9 +5975,6 @@ gst_avi_demux_stream_data (GstAviDemux * avi)
         gst_adapter_flush (avi->adapter, 8 + GST_ROUND_UP_2 (size));
       }
 
-#if 0
-      offset = avi->offset;
-#endif
       avi->offset += 8 + GST_ROUND_UP_2 (size);
 
       stream = &avi->stream[stream_nr];
@@ -5566,10 +5995,6 @@ gst_avi_demux_stream_data (GstAviDemux * avi)
         /* get time of this buffer */
         gst_pad_query_position (stream->pad, GST_FORMAT_TIME,
             (gint64 *) & next_ts);
-
-#if 0
-        gst_avi_demux_add_assoc (avi, stream, next_ts, offset, FALSE);
-#endif
 
         /* increment our positions */
         stream->current_entry++;
@@ -5599,7 +6024,7 @@ gst_avi_demux_stream_data (GstAviDemux * avi)
               (gint64 *) & dur_ts);
 
           GST_BUFFER_DTS (buf) = next_ts;
-          GST_BUFFER_PTS (buf) = GST_CLOCK_TIME_NONE;
+          GST_BUFFER_PTS (buf) = next_ts;
           GST_BUFFER_DURATION (buf) = dur_ts - next_ts;
           if (stream->strh->type == GST_RIFF_FCC_vids) {
             GST_BUFFER_OFFSET (buf) = stream->current_entry - 1;
@@ -5609,38 +6034,132 @@ gst_avi_demux_stream_data (GstAviDemux * avi)
             GST_BUFFER_OFFSET_END (buf) = GST_BUFFER_OFFSET_NONE;
           }
 
-          GST_DEBUG_OBJECT (avi,
-              "Pushing buffer with time=%" GST_TIME_FORMAT ", duration %"
-              GST_TIME_FORMAT ", offset %" G_GUINT64_FORMAT
-              " and size %d over pad %s", GST_TIME_ARGS (next_ts),
-              GST_TIME_ARGS (GST_BUFFER_DURATION (buf)),
-              GST_BUFFER_OFFSET (buf), size, GST_PAD_NAME (stream->pad));
-
-          /* mark discont when pending */
-          if (G_UNLIKELY (stream->discont)) {
-            GST_DEBUG_OBJECT (avi, "Setting DISCONT");
-            GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
-            stream->discont = FALSE;
-          } else {
-            GST_BUFFER_FLAG_UNSET (buf, GST_BUFFER_FLAG_DISCONT);
+#ifdef AVI_PUSHMODE_TRICK
+          if ((avi->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS)
+              && avi->segment_event_recvd && ((avi->num_streams == 1
+                      && avi->pushed_Iframe) || (avi->pushed_Iframe
+                      && avi->all_audio_pushed))) {
+            avi->pushed_Iframe = FALSE;
+            avi->pushed_Audio = FALSE;
+            avi->all_audio_pushed = FALSE;
+            /*We should unref all peeked buffers before moving to next I frame */
+            gst_buffer_unref (buf);
+            avi->prev_video_position = avi->video_position;
+            gst_avi_demux_handle_trick (avi, avi->video_position);
+            goto exit;
           }
+#endif
 
-          if (stream->alignment > 1)
-            buf = gst_avi_demux_align_buffer (avi, buf, stream->alignment);
-          res = gst_pad_push (stream->pad, buf);
-          buf = NULL;
+#ifdef AVI_PUSHMODE_TRICK
+          if (((avi->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS)
+                  && avi->all_audio_pushed == FALSE)
+              && avi->segment_event_recvd) {
+            if (!strcmp ("audio_0", GST_PAD_NAME (stream->pad))
+                && avi->pushed_Iframe == TRUE) {
+              avi->pushed_Audio = TRUE;
 
-          /* combine flows */
-          res = gst_avi_demux_combine_flows (avi, stream, res);
-          if (G_UNLIKELY (res != GST_FLOW_OK)) {
-            GST_DEBUG ("Push failed; %s", gst_flow_get_name (res));
-            return res;
+              GST_DEBUG_OBJECT (avi,
+                  "Pushing buffer with time=%" GST_TIME_FORMAT ", duration %"
+                  GST_TIME_FORMAT ", offset %" G_GUINT64_FORMAT
+                  " and size %d over pad %s", GST_TIME_ARGS (next_ts),
+                  GST_TIME_ARGS (GST_BUFFER_DURATION (buf)),
+                  GST_BUFFER_OFFSET (buf), size, GST_PAD_NAME (stream->pad));
+
+              /* mark discont when pending */
+              if (G_UNLIKELY (stream->discont)) {
+                GST_DEBUG_OBJECT (avi, "Setting DISCONT");
+                GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
+                stream->discont = FALSE;
+              } else {
+                GST_BUFFER_FLAG_UNSET (buf, GST_BUFFER_FLAG_DISCONT);
+              }
+
+              if (stream->alignment > 1)
+                buf = gst_avi_demux_align_buffer (avi, buf, stream->alignment);
+              res = gst_pad_push (stream->pad, buf);
+              buf = NULL;
+
+              /* combine flows */
+              res = gst_avi_demux_combine_flows (avi, stream, res);
+              if (G_UNLIKELY (res != GST_FLOW_OK)) {
+                GST_DEBUG ("Push failed; %s", gst_flow_get_name (res));
+                return res;
+              }
+            } else if (!strcmp ("video_0", GST_PAD_NAME (stream->pad))) {
+
+              if (avi->pushed_Audio) {
+                avi->all_audio_pushed = TRUE;
+                if (avi->segment.rate < 0.0
+                    && next_ts <= avi->prev_video_position)
+                  avi->all_audio_pushed = FALSE;
+              }
+              if (avi->all_audio_pushed == FALSE && avi->pushed_Iframe == FALSE) {
+                avi->pushed_Iframe = TRUE;
+                avi->video_position = avi->segment.position;
+                GST_DEBUG_OBJECT (avi,
+                    "Pushing buffer with time=%" GST_TIME_FORMAT ", duration %"
+                    GST_TIME_FORMAT ", offset %" G_GUINT64_FORMAT
+                    " and size %d over pad %s", GST_TIME_ARGS (next_ts),
+                    GST_TIME_ARGS (GST_BUFFER_DURATION (buf)),
+                    GST_BUFFER_OFFSET (buf), size, GST_PAD_NAME (stream->pad));
+                /* mark discont when pending */
+                if (G_UNLIKELY (stream->discont)) {
+                  GST_DEBUG_OBJECT (avi, "Setting DISCONT");
+                  GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
+                  stream->discont = FALSE;
+                } else {
+                  GST_BUFFER_FLAG_UNSET (buf, GST_BUFFER_FLAG_DISCONT);
+                }
+
+                if (stream->alignment > 1)
+                  buf =
+                      gst_avi_demux_align_buffer (avi, buf, stream->alignment);
+                res = gst_pad_push (stream->pad, buf);
+                buf = NULL;
+
+                /* combine flows */
+                res = gst_avi_demux_combine_flows (avi, stream, res);
+                if (G_UNLIKELY (res != GST_FLOW_OK)) {
+                  GST_DEBUG ("Push failed; %s", gst_flow_get_name (res));
+                  return res;
+                }
+              } else {
+                gst_buffer_unref (buf);
+              }
+            }
+
+          } else if (avi->segment_event_recvd && avi->segment.rate > 0.0) {
+
+#endif
+            GST_DEBUG_OBJECT (avi,
+                "Pushing buffer with time=%" GST_TIME_FORMAT ", duration %"
+                GST_TIME_FORMAT ", offset %" G_GUINT64_FORMAT
+                " and size %d over pad %s", GST_TIME_ARGS (next_ts),
+                GST_TIME_ARGS (GST_BUFFER_DURATION (buf)),
+                GST_BUFFER_OFFSET (buf), size, GST_PAD_NAME (stream->pad));
+            /* mark discont when pending */
+            if (G_UNLIKELY (stream->discont) && avi->rate_changed) {
+              GST_DEBUG_OBJECT (avi, "Setting DISCONT");
+              GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
+              stream->discont = FALSE;
+            } else {
+              GST_BUFFER_FLAG_UNSET (buf, GST_BUFFER_FLAG_DISCONT);
+            }
+            res = gst_pad_push (stream->pad, buf);
+            buf = NULL;
+
+            /* combine flows */
+            res = gst_avi_demux_combine_flows (avi, stream, res);
+            if (G_UNLIKELY (res != GST_FLOW_OK)) {
+              GST_DEBUG ("Push failed; %s", gst_flow_get_name (res));
+              return res;
+            }
           }
         }
       }
     }
   }
-
+exit:
   return res;
 }
 
@@ -5709,9 +6228,17 @@ gst_avi_demux_loop (GstPad * pad)
       avi->state = GST_AVI_DEMUX_MOVI;
       break;
     case GST_AVI_DEMUX_MOVI:
+      if (avi->isNotSupportCodec)
+        goto not_support;
+
       if (G_UNLIKELY (avi->seg_event)) {
         gst_avi_demux_push_event (avi, avi->seg_event);
         avi->seg_event = NULL;
+
+        /* Push gap event to downstream element if we do not need audio */
+        if (avi->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS ||
+            avi->segment.flags & GST_SEGMENT_FLAG_TRICKMODE_NO_AUDIO)
+          gst_avi_demux_push_gap_audio (avi);
       }
       if (G_UNLIKELY (avi->got_tags)) {
         push_tag_lists (avi);
@@ -5792,6 +6319,11 @@ pause:{
             (NULL), ("got eos but no streams (yet)"));
       }
     }
+    return;
+  }
+not_support:
+  {
+    GST_ELEMENT_ERROR (avi, STREAM, DEMUX, (NULL), ("not support file type"));
   }
 }
 
@@ -5829,6 +6361,12 @@ gst_avi_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
       }
       break;
     case GST_AVI_DEMUX_MOVI:
+      if (!avi->isInterleaved && avi->num_streams > 1)
+        goto not_support;
+
+      if (avi->isNotSupportCodec)
+        goto not_support;
+
       if (G_UNLIKELY (avi->seg_event)) {
         gst_avi_demux_push_event (avi, avi->seg_event);
         avi->seg_event = NULL;
@@ -5908,6 +6446,11 @@ abort_buffering:
     GST_ELEMENT_ERROR (avi, STREAM, DEMUX, (NULL), ("unhandled buffer size"));
     return GST_FLOW_ERROR;
   }
+not_support:
+  {
+    GST_ELEMENT_ERROR (avi, STREAM, DEMUX, (NULL), ("not support file type"));
+    return GST_FLOW_NOT_SUPPORTED;
+  }
 }
 
 static gboolean
@@ -5973,51 +6516,27 @@ gst_avi_demux_sink_activate_mode (GstPad * sinkpad, GstObject * parent,
   return res;
 }
 
-#if 0
-static void
-gst_avi_demux_set_index (GstElement * element, GstIndex * index)
-{
-  GstAviDemux *avi = GST_AVI_DEMUX (element);
-
-  GST_OBJECT_LOCK (avi);
-  if (avi->element_index)
-    gst_object_unref (avi->element_index);
-  if (index) {
-    avi->element_index = gst_object_ref (index);
-  } else {
-    avi->element_index = NULL;
-  }
-  GST_OBJECT_UNLOCK (avi);
-  /* object lock might be taken again */
-  if (index)
-    gst_index_get_writer_id (index, GST_OBJECT_CAST (element), &avi->index_id);
-  GST_DEBUG_OBJECT (avi, "Set index %" GST_PTR_FORMAT, avi->element_index);
-}
-
-static GstIndex *
-gst_avi_demux_get_index (GstElement * element)
-{
-  GstIndex *result = NULL;
-  GstAviDemux *avi = GST_AVI_DEMUX (element);
-
-  GST_OBJECT_LOCK (avi);
-  if (avi->element_index)
-    result = gst_object_ref (avi->element_index);
-  GST_OBJECT_UNLOCK (avi);
-
-  GST_DEBUG_OBJECT (avi, "Returning index %" GST_PTR_FORMAT, result);
-
-  return result;
-}
-#endif
-
 static GstStateChangeReturn
 gst_avi_demux_change_state (GstElement * element, GstStateChange transition)
 {
   GstStateChangeReturn ret;
+  GstSmartPropertiesReturn property_ret;
   GstAviDemux *avi = GST_AVI_DEMUX (element);
-
+  GstAviStream *stream = NULL;
+  guint num;
   switch (transition) {
+    case GST_STATE_CHANGE_NULL_TO_READY:
+      /* For thumbnail extraction */
+      property_ret = gst_element_get_smart_properties (GST_ELEMENT_CAST (avi),
+          "thumbnail-mode", &avi->thumbnail_mode, NULL);
+
+      if (property_ret != GST_SMART_PROPERTIES_OK) {
+        GST_WARNING_OBJECT (avi, "faield to get thumbnail-mode property");
+        avi->thumbnail_mode = FALSE;
+      }
+
+      GST_INFO_OBJECT (avi, "thumbnail-mode = %d", avi->thumbnail_mode);
+      break;
     case GST_STATE_CHANGE_READY_TO_PAUSED:
       avi->streaming = FALSE;
       gst_segment_init (&avi->segment, GST_FORMAT_TIME);
@@ -6035,10 +6554,123 @@ gst_avi_demux_change_state (GstElement * element, GstStateChange transition)
       avi->have_index = FALSE;
       gst_avi_demux_reset (avi);
       break;
+    case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
+      for (num = 0; num < avi->num_streams; num++) {
+        stream = &avi->stream[num];
+        if (stream->pad && stream->strh->type == GST_RIFF_FCC_auds &&
+            stream->current_timestamp == -1) {
+          if (GST_CLOCK_TIME_IS_VALID (stream->idx_duration) &&
+              GST_CLOCK_TIME_IS_VALID (avi->segment.duration) &&
+              stream->stop_entry - 1 <= stream->current_entry) {
+
+            guint64 start = stream->idx_duration;
+            guint64 stop = avi->segment.duration;
+            guint64 gap_time;
+            GstEvent *gap = NULL;
+
+            gap_time = start > stop ? (start - stop) : (stop - start);
+
+            if (gap_time > 10 * GST_SECOND) {
+              gap = gst_event_new_gap (start, (stop - start));
+              gst_pad_push_event (stream->pad, gap);
+
+              GST_INFO_OBJECT (avi,
+                  "push gap event stream %d with start time :%"
+                  GST_TIME_FORMAT " duration: %" GST_TIME_FORMAT, stream->num,
+                  GST_TIME_ARGS (start), GST_TIME_ARGS (stop - start));
+            }
+          }
+        }
+      }
     default:
       break;
   }
 
 done:
   return ret;
+}
+
+static void
+gst_avi_demux_parse_mpegaudio (GstAviDemux * avi)
+{
+  GstAviStream *stream;
+  GstMapInfo map;
+  const guint8 *dataHeader;
+  guint32 mp3Header = 0;
+  guint count;
+
+  /*For check mp3 files audio VBR/CBR - zeldasky 2012-04-05 */
+  /*MPEG version1 Layer3 or MPEG version2 Layer3 */
+  for (count = 0; count < avi->num_streams; count++) {
+    stream = &avi->stream[count];
+
+    if (stream->strh->type == GST_RIFF_FCC_auds &&
+        stream->strf.auds->format == GST_MP3_FOURCC) {
+
+      if (avi->streaming) {
+        if (gst_adapter_available (avi->adapter) < 24)
+          GST_ERROR_OBJECT (avi,
+              "failed getting an enough data while looking for MP3 Header");
+
+        dataHeader = gst_adapter_map (avi->adapter, 24);
+        mp3Header = GST_READ_UINT32_BE (dataHeader + 20);
+        gst_adapter_unmap (avi->adapter);
+      } else {
+        GstBuffer *bufParse = NULL;
+        if (gst_pad_pull_range (avi->sinkpad, avi->offset + 20, 4,
+                &bufParse) != GST_FLOW_OK || gst_buffer_get_size (bufParse) < 4)
+          GST_ERROR_OBJECT (avi,
+              "failed getting an enough data while looking for MP3 Header");
+
+        if (!bufParse)
+          continue;
+
+        gst_buffer_map (bufParse, &map, GST_MAP_READ);
+
+        dataHeader = map.data;
+        mp3Header = GST_READ_UINT32_BE (dataHeader);
+
+        gst_buffer_unmap (bufParse, &map);
+        gst_buffer_unref (bufParse);
+      }
+
+      if (GST_GET_MP3_FRAMESYNC (mp3Header) == GST_MP3_FRAMESYNC) {
+        if ((GST_GET_MP3_VERSION (mp3Header) == GST_MP3_VERSION2
+                && stream->strh->samplesize == 576)
+            || (GST_GET_MP3_VERSION (mp3Header) == GST_MP3_VERSION1
+                && stream->strh->samplesize == 1152))
+          stream->is_vbr = TRUE;
+      }
+    }
+  }
+}
+
+static gboolean
+gst_avi_demux_check_divx (guint32 fourcc)
+{
+  gboolean res = FALSE;
+
+  switch (fourcc) {
+    case GST_MAKE_FOURCC ('D', 'X', '5', '0'):
+    case GST_MAKE_FOURCC ('d', 'i', 'v', 'x'):
+    case GST_MAKE_FOURCC ('D', 'I', 'V', 'X'):
+    case GST_MAKE_FOURCC ('D', 'I', 'V', '3'):
+    case GST_MAKE_FOURCC ('d', 'i', 'v', '3'):
+    case GST_MAKE_FOURCC ('D', 'V', 'X', '3'):
+    case GST_MAKE_FOURCC ('d', 'v', 'x', '3'):
+    case GST_MAKE_FOURCC ('D', 'I', 'V', '4'):
+    case GST_MAKE_FOURCC ('d', 'i', 'v', '4'):
+    case GST_MAKE_FOURCC ('D', 'I', 'V', '5'):
+    case GST_MAKE_FOURCC ('d', 'i', 'v', '5'):
+    case GST_MAKE_FOURCC ('D', 'I', 'V', '6'):
+    case GST_MAKE_FOURCC ('d', 'i', 'v', '6'):
+      res = TRUE;
+      break;
+
+    default:
+      break;
+  }
+
+  return res;
+
 }

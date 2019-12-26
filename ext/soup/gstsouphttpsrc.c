@@ -74,6 +74,7 @@
 #include <string.h>
 #ifdef HAVE_STDLIB_H
 #include <stdlib.h>             /* atoi() */
+#include <stdio.h>              /* sscanf() */
 #endif
 #include <gst/gstelement.h>
 #include <gst/gst-i18n-plugin.h>
@@ -92,6 +93,14 @@ static GstStaticPadTemplate srctemplate = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS_ANY);
+
+enum
+{
+  /* signals */
+  GOT_HEADERS_SIGNAL = 0,
+  GOT_CHUNK_SIGNAL,
+  LAST_SIGNAL
+};
 
 enum
 {
@@ -119,29 +128,56 @@ enum
   PROP_RETRIES,
   PROP_METHOD,
   PROP_TLS_INTERACTION,
+  PROP_DLNA_CONTENTLENGTH,
+  PROP_DLNA_OPVAL,
+  PROP_DLNA_FLAGVAL,
+  PROP_IS_DTCP,
+  PROP_CURRENT_POSITION,
+  PROP_START_OFFSET,
+  PROP_END_OFFSET,
+  PROP_LAST
 };
 
-#define DEFAULT_USER_AGENT           "GStreamer souphttpsrc " PACKAGE_VERSION " "
+#define DEFAULT_USER_AGENT           "GStreamer souphttpsrc (compatible; LG NetCast.TV-2013) "
+#define DEFAULT_BLOCKSIZE            (24 * 1024)
 #define DEFAULT_IRADIO_MODE          TRUE
 #define DEFAULT_SOUP_LOG_LEVEL       SOUP_LOGGER_LOG_HEADERS
 #define DEFAULT_COMPRESS             FALSE
-#define DEFAULT_KEEP_ALIVE           TRUE
-#define DEFAULT_SSL_STRICT           TRUE
+#define DEFAULT_KEEP_ALIVE           FALSE
+#define DEFAULT_SSL_STRICT           FALSE
 #define DEFAULT_SSL_CA_FILE          NULL
 #define DEFAULT_SSL_USE_SYSTEM_CA_FILE TRUE
 #define DEFAULT_TLS_DATABASE         NULL
 #define DEFAULT_TLS_INTERACTION      NULL
 #define DEFAULT_TIMEOUT              15
-#define DEFAULT_RETRIES              3
+#define DEFAULT_RETRIES              2
 #define DEFAULT_SOUP_METHOD          NULL
 
-#define GROW_BLOCKSIZE_LIMIT 1
-#define GROW_BLOCKSIZE_COUNT 1
-#define GROW_BLOCKSIZE_FACTOR 2
-#define REDUCE_BLOCKSIZE_LIMIT 0.20
-#define REDUCE_BLOCKSIZE_COUNT 2
-#define REDUCE_BLOCKSIZE_FACTOR 0.5
+static guint soup_http_src_signals[LAST_SIGNAL] = { 0, };
 
+#define SOCK_POLLING_TIMEOUT  180
+
+/**
+ * GST_NPT_TIME_FORMAT:
+ *
+ * A npt time format for DLNA
+ */
+#define GST_NPT_TIME_FORMAT "u:%02u:%02u.%03u"
+/**
+ * GST_NPT_TIME_ARGS:
+ * @t: a #GstClockTime
+ *
+ * Format @t for the GST_NPT_TIME_FORMAT format string.
+ */
+#define GST_NPT_TIME_ARGS(t) \
+        GST_CLOCK_TIME_IS_VALID (t) ? \
+        (guint) (((GstClockTime)(t)) / (GST_SECOND * 60 * 60)) : 99, \
+        GST_CLOCK_TIME_IS_VALID (t) ? \
+        (guint) ((((GstClockTime)(t)) / (GST_SECOND * 60)) % 60) : 99, \
+        GST_CLOCK_TIME_IS_VALID (t) ? \
+        (guint) ((((GstClockTime)(t)) / GST_SECOND) % 60) : 99, \
+        GST_CLOCK_TIME_IS_VALID (t) ? \
+        (guint) ((((GstClockTime)(t)) % GST_SECOND)/1000000) : 999
 static void gst_soup_http_src_uri_handler_init (gpointer g_iface,
     gpointer iface_data);
 static void gst_soup_http_src_finalize (GObject * gobject);
@@ -186,6 +222,14 @@ static GstFlowReturn gst_soup_http_src_got_headers (GstSoupHTTPSrc * src,
 static void gst_soup_http_src_authenticate_cb (SoupSession * session,
     SoupMessage * msg, SoupAuth * auth, gboolean retrying,
     GstSoupHTTPSrc * src);
+static void gst_soup_http_src_duration_set_n_post (GstSoupHTTPSrc * src);
+static gboolean gst_soup_http_src_add_time_seek_range_header (GstSoupHTTPSrc *
+    src, guint64 offset);
+static gboolean gst_soup_http_src_add_cleartext_range_header (GstSoupHTTPSrc *
+    src, guint64 offset);
+static gboolean gst_soup_http_src_handle_custom_query (GstSoupHTTPSrc * src,
+    GstQuery * query);
+static gboolean gst_soup_http_src_query_dtcp_seekable (GstBaseSrc * bsrc);
 
 #define gst_soup_http_src_parent_class parent_class
 G_DEFINE_TYPE_WITH_CODE (GstSoupHTTPSrc, gst_soup_http_src, GST_TYPE_PUSH_SRC,
@@ -256,7 +300,7 @@ gst_soup_http_src_class_init (GstSoupHTTPSrcClass * klass)
   g_object_class_install_property (gobject_class, PROP_TIMEOUT,
       g_param_spec_uint ("timeout", "timeout",
           "Value in seconds to timeout a blocking I/O (0 = No timeout).", 0,
-          3600, DEFAULT_TIMEOUT, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+          SOCK_POLLING_TIMEOUT, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_EXTRA_HEADERS,
       g_param_spec_boxed ("extra-headers", "Extra Headers",
           "Extra headers to append to the HTTP request",
@@ -420,6 +464,46 @@ gst_soup_http_src_class_init (GstSoupHTTPSrcClass * klass)
   gstelement_class->set_context =
       GST_DEBUG_FUNCPTR (gst_soup_http_src_set_context);
 
+  /* dlna stuff */
+  g_object_class_install_property (gobject_class, PROP_IS_DTCP,
+      g_param_spec_boolean ("is-dtcp", "DTCP-IP", "is DTCP-IP content?",
+          FALSE, G_PARAM_WRITABLE));
+
+  g_object_class_install_property (gobject_class, PROP_CURRENT_POSITION,
+      g_param_spec_uint64 ("current-position", "Current Position",
+          "A Position where to read from the URL",
+          0, G_MAXUINT64, 0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_START_OFFSET,
+      g_param_spec_uint64 ("start-offset", "start offset",
+          "First byte of a byte range (0 = From beginning).", 0,
+          G_MAXUINT64, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_END_OFFSET,
+      g_param_spec_uint64 ("end-offset", "end offset",
+          "Last byte of a byte range (0 = Till the end).", 0,
+          G_MAXUINT64, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  /**
+ * SoupHTTPsrc::got-headers:
+ *
+ * Notify when the response message headers are received.
+ */
+  soup_http_src_signals[GOT_HEADERS_SIGNAL] =
+      g_signal_new ("got-headers", G_TYPE_FROM_CLASS (klass),
+      G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstSoupHTTPSrcClass, got_headers),
+      NULL, NULL, g_cclosure_marshal_VOID__POINTER, G_TYPE_NONE, 1,
+      G_TYPE_POINTER);
+
+/**
+  * SoupHTTPsrc::got-chunk:
+  *
+  * Notify when a new data chunk is received.
+  */
+  soup_http_src_signals[GOT_CHUNK_SIGNAL] =
+      g_signal_new ("got-chunk", G_TYPE_FROM_CLASS (klass),
+      G_SIGNAL_RUN_LAST, G_STRUCT_OFFSET (GstSoupHTTPSrcClass, got_chunk),
+      NULL, NULL, NULL, G_TYPE_NONE, 1, G_TYPE_UINT);
+
   gstbasesrc_class->start = GST_DEBUG_FUNCPTR (gst_soup_http_src_start);
   gstbasesrc_class->stop = GST_DEBUG_FUNCPTR (gst_soup_http_src_stop);
   gstbasesrc_class->unlock = GST_DEBUG_FUNCPTR (gst_soup_http_src_unlock);
@@ -441,6 +525,7 @@ static void
 gst_soup_http_src_reset (GstSoupHTTPSrc * src)
 {
   src->retry_count = 0;
+  src->cancel = FALSE;
   src->have_size = FALSE;
   src->got_headers = FALSE;
   src->seekable = FALSE;
@@ -450,9 +535,6 @@ gst_soup_http_src_reset (GstSoupHTTPSrc * src)
   src->content_size = 0;
   src->have_body = FALSE;
 
-  src->reduce_blocksize_count = 0;
-  src->increase_blocksize_count = 0;
-
   g_cancellable_reset (src->cancellable);
   g_mutex_lock (&src->mutex);
   if (src->input_stream) {
@@ -460,6 +542,15 @@ gst_soup_http_src_reset (GstSoupHTTPSrc * src)
     src->input_stream = NULL;
   }
   g_mutex_unlock (&src->mutex);
+
+  src->dlna_mode = FALSE;
+  src->opval = 0x111;
+  src->flagval = 0x111;
+  src->is_dtcp = FALSE;
+  src->request_cb_position = 0;
+
+  src->time_seek_flag = FALSE;
+  src->request_time = GST_CLOCK_TIME_NONE;
 
   gst_caps_replace (&src->src_caps, NULL);
   g_free (src->iradio_name);
@@ -502,7 +593,10 @@ gst_soup_http_src_init (GstSoupHTTPSrc * src)
   src->tls_interaction = DEFAULT_TLS_INTERACTION;
   src->max_retries = DEFAULT_RETRIES;
   src->method = DEFAULT_SOUP_METHOD;
-  src->minimum_blocksize = gst_base_src_get_blocksize (GST_BASE_SRC_CAST (src));
+  src->timeout = SOCK_POLLING_TIMEOUT;
+  src->opval = 0x111;
+  src->flagval = 0x111;
+
   proxy = g_getenv ("http_proxy");
   if (!gst_soup_http_src_set_proxy (src, proxy)) {
     GST_WARNING_OBJECT (src,
@@ -510,6 +604,7 @@ gst_soup_http_src_init (GstSoupHTTPSrc * src)
         proxy);
   }
 
+  gst_base_src_set_blocksize (GST_BASE_SRC (src), DEFAULT_BLOCKSIZE);
   gst_base_src_set_automatic_eos (GST_BASE_SRC (src), FALSE);
 
   gst_soup_http_src_reset (src);
@@ -641,6 +736,12 @@ gst_soup_http_src_set_property (GObject * object, guint prop_id,
     case PROP_TIMEOUT:
       src->timeout = g_value_get_uint (value);
       break;
+    case PROP_START_OFFSET:
+      src->start_offset = g_value_get_uint64 (value);
+      break;
+    case PROP_END_OFFSET:
+      src->end_offset = g_value_get_uint64 (value);
+      break;
     case PROP_EXTRA_HEADERS:{
       const GstStructure *s = gst_value_get_structure (value);
 
@@ -679,6 +780,9 @@ gst_soup_http_src_set_property (GObject * object, guint prop_id,
       break;
     case PROP_RETRIES:
       src->max_retries = g_value_get_int (value);
+      break;
+    case PROP_IS_DTCP:
+      src->is_dtcp = g_value_get_boolean (value);
       break;
     case PROP_METHOD:
       g_free (src->method);
@@ -742,6 +846,27 @@ gst_soup_http_src_get_property (GObject * object, guint prop_id,
     case PROP_TIMEOUT:
       g_value_set_uint (value, src->timeout);
       break;
+    case PROP_DLNA_CONTENTLENGTH:
+      g_value_set_uint64 (value, src->content_size);
+      break;
+    case PROP_DLNA_OPVAL:
+      g_value_set_uint (value, src->opval);
+      break;
+    case PROP_DLNA_FLAGVAL:
+      g_value_set_uint (value, src->flagval);
+      break;
+    case PROP_IS_DTCP:
+      g_value_set_boolean (value, src->is_dtcp);
+      break;
+    case PROP_CURRENT_POSITION:
+      g_value_set_uint64 (value, src->read_position);
+      break;
+    case PROP_START_OFFSET:
+      g_value_set_uint64 (value, src->start_offset);
+      break;
+    case PROP_END_OFFSET:
+      g_value_set_uint64 (value, src->end_offset);
+      break;
     case PROP_EXTRA_HEADERS:
       gst_value_set_structure (value, src->extra_headers);
       break;
@@ -803,22 +928,65 @@ gst_soup_http_src_add_range_header (GstSoupHTTPSrc * src, guint64 offset,
     guint64 stop_offset)
 {
   gchar buf[64];
-  gint rc;
+  gint rc, buf_size;
+
+  if (src->is_dtcp)
+    return gst_soup_http_src_add_cleartext_range_header (src,
+        src->request_cb_position);
+
+  buf_size = (gint) sizeof (buf);
 
   soup_message_headers_remove (src->msg->request_headers, "Range");
-  if (offset || stop_offset != -1) {
+  /* TODO: support position requests with byte ranges */
+  if (offset == 0 && (src->start_offset > 0 || src->end_offset > 0)) {
+    /* we have a valid byte range */
+    if (src->end_offset == 0) {
+      /* src->start_offset > 0, src->end_offset == 0 ==> read till the end of file */
+      rc = g_snprintf (buf, buf_size, "bytes=%" G_GUINT64_FORMAT "-",
+          src->start_offset);
+    } else {
+      /* src->start_offset >= 0, src->end_offset > 0 */
+      if (src->start_offset > src->end_offset) {
+        GST_WARNING_OBJECT (src,
+            "Invalid byte range requested: start_offset %" G_GUINT64_FORMAT
+            " > end_offset %" G_GUINT64_FORMAT, src->start_offset,
+            src->end_offset);
+        return FALSE;
+      }
+      rc = g_snprintf (buf, buf_size, "bytes=%" G_GUINT64_FORMAT
+          "-%" G_GUINT64_FORMAT, src->start_offset, src->end_offset);
+    }
+
+    if (rc > buf_size || rc < 0) {
+      GST_WARNING_OBJECT (src,
+          "Byte range string length %d exceeds the maximum length allowed %d",
+          rc, buf_size);
+      return FALSE;
+    }
+    GST_DEBUG_OBJECT (src, "Appending byte range header %s", buf);
+    soup_message_headers_append (src->msg->request_headers, "Range", buf);
+  }
+  /* In case that content size is unknown under DLNA bytes seek,
+     set Range header starting zero */
+  else if (!src->content_size && (src->opval == 0x01 || src->opval == 0x11)) {
+    rc = g_snprintf (buf, buf_size, "bytes=0-");
+    if (rc > buf_size || rc < 0)
+      return FALSE;
+    GST_DEBUG_OBJECT (src, "Appending byte range header %s", buf);
+    soup_message_headers_append (src->msg->request_headers, "range", buf);
+  } else {
     if (stop_offset != -1) {
       g_assert (offset != stop_offset);
 
-      rc = g_snprintf (buf, sizeof (buf), "bytes=%" G_GUINT64_FORMAT "-%"
+      rc = g_snprintf (buf, buf_size, "bytes=%" G_GUINT64_FORMAT "-%"
           G_GUINT64_FORMAT, offset, (stop_offset > 0) ? stop_offset - 1 :
           stop_offset);
     } else {
-      rc = g_snprintf (buf, sizeof (buf), "bytes=%" G_GUINT64_FORMAT "-",
-          offset);
+      rc = g_snprintf (buf, buf_size, "bytes=%" G_GUINT64_FORMAT "-", offset);
     }
-    if (rc > sizeof (buf) || rc < 0)
+    if (rc > buf_size || rc < 0)
       return FALSE;
+    GST_DEBUG_OBJECT (src, "Appending byte range header %s", buf);
     soup_message_headers_append (src->msg->request_headers, "Range", buf);
   }
   src->read_position = offset;
@@ -903,6 +1071,9 @@ gst_soup_http_src_add_extra_headers (GstSoupHTTPSrc * src)
 static gboolean
 gst_soup_http_src_session_open (GstSoupHTTPSrc * src)
 {
+  const GValue *value;
+  GstBaseSrc *basesrc = GST_BASE_SRC_CAST (src);
+
   if (src->session) {
     GST_DEBUG_OBJECT (src, "Session is already open");
     return TRUE;
@@ -914,6 +1085,71 @@ gst_soup_http_src_session_open (GstSoupHTTPSrc * src)
     return FALSE;
   }
 
+  if (basesrc->smart_prop) {
+    /*  Initialize variables from smart-properties of basesrc  */
+    if ((value = gst_structure_get_value (basesrc->smart_prop,
+                "dlna-contentlength")) != 0) {
+      src->content_size = g_value_get_uint64 (value);
+      src->dlna_mode = TRUE;
+      gst_base_src_set_automatic_eos (GST_BASE_SRC (src), TRUE);
+
+      if (src->content_size == (guint64) - 1)
+        src->content_size = 0;
+      GST_DEBUG_OBJECT (src,
+          "set automatic_eos TRUE, dlna content-length to size = %"
+          G_GUINT64_FORMAT, src->content_size);
+    }
+
+    if (gst_structure_get_uint (basesrc->smart_prop, "dlna-opval", &src->opval))
+      GST_DEBUG_OBJECT (src, "set opval= %" G_GUINT32_FORMAT, src->opval);
+
+    if (gst_structure_get_uint (basesrc->smart_prop, "dlna-flagval",
+            &src->flagval)) {
+      GST_DEBUG_OBJECT (src, "set flagval= %" G_GUINT32_FORMAT, src->flagval);
+    }
+  }
+  if (!src->dlna_mode)
+    src->opval = 0x111;
+
+  /* opval
+     0x00 = non seekable
+     0x01 = byteseek
+     0x10 = timeseek
+     0x11 = byteseek & timeseek
+     0x111 = no dlna
+   */
+
+  GST_DEBUG_OBJECT (src, "dlna opval = %d, flagval=%d, src->is_dtcp:%d",
+      src->opval, src->flagval, src->is_dtcp);
+  if (src->is_dtcp) {
+    src->seekable =
+        gst_soup_http_src_query_dtcp_seekable (GST_BASE_SRC_CAST (src));
+    GST_DEBUG_OBJECT (src, "DTCP-IP content - seekable (%s)",
+        src->seekable ? "TRUE" : "FALSE");
+  } else {
+    switch (src->opval) {
+      case 0x111:
+        GST_DEBUG_OBJECT (src, "no dlna");
+        break;
+      case 0x00:
+        GST_DEBUG_OBJECT (src, "dlna - non seekable");
+        src->seekable = FALSE;
+        break;
+      case 0x01:
+        GST_DEBUG_OBJECT (src, "dlna - byte seekable");
+        src->seekable = TRUE;
+        break;
+      case 0x10:
+        GST_DEBUG_OBJECT (src, "dlna - time seekable");
+        src->seekable = TRUE;
+        break;
+      case 0x11:
+        GST_DEBUG_OBJECT (src, "dlna - byte & time seekable");
+        src->seekable = TRUE;
+        break;
+
+    }
+  }
   if (!src->session) {
     GstQuery *query;
     gboolean can_share = (src->timeout == DEFAULT_TIMEOUT)
@@ -971,7 +1207,12 @@ gst_soup_http_src_session_open (GstSoupHTTPSrc * src)
             GST_ELEMENT (src));
         soup_session_add_feature_by_type (src->session,
             SOUP_TYPE_CONTENT_DECODER);
-        soup_session_add_feature_by_type (src->session, SOUP_TYPE_COOKIE_JAR);
+        /* FIXME: Check proper usage of SOUP_TYPE_COOKIE_JAR feature */
+        if (src->cookies) {
+          GST_DEBUG_OBJECT (src, "Cookies are set using cookies property.");
+        } else {
+          soup_session_add_feature_by_type (src->session, SOUP_TYPE_COOKIE_JAR);
+        }
 
         if (can_share) {
           GstContext *context;
@@ -1028,6 +1269,16 @@ gst_soup_http_src_session_open (GstSoupHTTPSrc * src)
     GST_DEBUG_OBJECT (src, "Re-using session");
   }
 
+  if (src->compress)
+    soup_session_add_feature_by_type (src->session, SOUP_TYPE_CONTENT_DECODER);
+  else
+    soup_session_remove_feature_by_type (src->session,
+        SOUP_TYPE_CONTENT_DECODER);
+
+  if (src->opval == 0x10) {
+    GST_DEBUG_OBJECT (src, "Set basesrc format : GST_FORMAT_TIME");
+    gst_base_src_set_format (GST_BASE_SRC (src), GST_FORMAT_TIME);
+  }
   return TRUE;
 }
 
@@ -1112,6 +1363,65 @@ insert_http_header (const gchar * name, const gchar * value, gpointer user_data)
   }
 }
 
+static gboolean
+gst_soup_http_src_parse_byte_range (const gchar * val, goffset * start,
+    goffset * end, goffset * total_length, gpointer src)
+{
+  gchar *header_value = NULL;
+
+  const gchar *byteHdr = "bytes";
+  gint ret_code = 0;
+  guint64 startBytePos = 0;
+  guint64 endBytePos = 0;
+  guint64 totalLen = 0;
+
+  val = strstr (val, byteHdr);
+  if (val)
+    header_value = strstr (val, "=");
+  if (val && !header_value)
+    header_value = strstr (val, " ");
+  if (header_value)
+    header_value++;
+  else {
+    GST_DEBUG_OBJECT (src,
+        "Bytes not included in header from HEAD response field header value: %s",
+        val);
+    return FALSE;
+  }
+
+  if (strstr (header_value, "/") && !strstr (header_value, "*")) {
+    /* Extract start and end and total_length BYTES */
+    if ((ret_code =
+            sscanf (header_value,
+                "%" G_GUINT64_FORMAT "-%" G_GUINT64_FORMAT "/%"
+                G_GUINT64_FORMAT, &startBytePos, &endBytePos,
+                &totalLen)) != 3) {
+      GST_DEBUG_OBJECT (src,
+          "Problems parsing BYTES from response header %s, value: %s, retcode: %d, BytesPos: %"
+          G_GUINT64_FORMAT ", %" G_GUINT64_FORMAT ", %" G_GUINT64_FORMAT, val,
+          header_value, ret_code, startBytePos, endBytePos, totalLen);
+      return FALSE;
+    }
+  } else {
+    /* Extract start and end (there is no total) BYTES */
+    if ((ret_code =
+            sscanf (header_value,
+                "%" G_GUINT64_FORMAT "-%" G_GUINT64_FORMAT, &startBytePos,
+                &endBytePos)) != 2) {
+      GST_DEBUG_OBJECT (src,
+          "Problems parsing BYTES from response header %s, value: %s, retcode: %d, BytesPos: %"
+          G_GUINT64_FORMAT ", %" G_GUINT64_FORMAT, val, header_value,
+          ret_code, startBytePos, endBytePos);
+      return FALSE;
+    }
+  }
+
+  *start = startBytePos;
+  *end = endBytePos;
+  *total_length = totalLen;
+  return TRUE;
+}
+
 static GstFlowReturn
 gst_soup_http_src_got_headers (GstSoupHTTPSrc * src, SoupMessage * msg)
 {
@@ -1123,6 +1433,8 @@ gst_soup_http_src_got_headers (GstSoupHTTPSrc * src, SoupMessage * msg)
   GstEvent *http_headers_event;
   GstStructure *http_headers, *headers;
   const gchar *accept_ranges;
+  goffset start = -1, end = -1, total_length = -1;
+  GArray *out_val_array = g_array_sized_new (FALSE, FALSE, sizeof (goffset), 4);
 
   GST_INFO_OBJECT (src, "got headers");
 
@@ -1172,29 +1484,97 @@ gst_soup_http_src_got_headers (GstSoupHTTPSrc * src, SoupMessage * msg)
   /* Parse Content-Length. */
   if (soup_message_headers_get_encoding (msg->response_headers) ==
       SOUP_ENCODING_CONTENT_LENGTH) {
+    /* try to find byte position in case of DLNA time based seek */
+    if (src->content_size && src->opval == 0x10) {
+      goffset content_length =
+          soup_message_headers_get_content_length (msg->response_headers);
+
+      if (src->content_size > content_length)
+        src->request_position = src->content_size - content_length;
+      else
+        src->request_position = 0;
+
+      src->read_position = src->request_position;
+      gst_soup_http_src_duration_set_n_post (src);
+    }
     newsize = src->request_position +
         soup_message_headers_get_content_length (msg->response_headers);
+
     if (!src->have_size || (src->content_size != newsize)) {
       src->content_size = newsize;
       src->have_size = TRUE;
-      src->seekable = TRUE;
+      /* content length is not a suitable way to device whether server is seekable */
+      if (src->opval != 0x00)
+        src->seekable = TRUE;
+
       GST_DEBUG_OBJECT (src, "size = %" G_GUINT64_FORMAT, src->content_size);
 
       basesrc = GST_BASE_SRC_CAST (src);
-      basesrc->segment.duration = src->content_size;
+      gst_soup_http_src_duration_set_n_post (src);
+      if (src->opval != 0x10)   /* No need to update for TimeSeek header. */
+        basesrc->segment.duration = src->content_size;
       gst_element_post_message (GST_ELEMENT (src),
           gst_message_new_duration_changed (GST_OBJECT (src)));
     }
+  } else if (soup_message_headers_get_encoding (msg->response_headers) ==
+      SOUP_ENCODING_CHUNKED) {
+    if (src->dlna_mode) {
+      if ((value = soup_message_headers_get_one (msg->response_headers,
+                  "TimeSeekRange.dlna.org")) != NULL) {
+        if (gst_soup_http_src_parse_byte_range (value, &start,
+                &end, &total_length, src)) {
+          if (src->content_size > start)
+            src->request_position = start;
+          else
+            src->request_position = 0;
+          src->read_position = src->request_position;
+        }
+      }
+      gst_soup_http_src_duration_set_n_post (src);
+    }
   }
+  /* Parse Content-Range. */
+  if (soup_message_headers_get_content_range (msg->response_headers, &start,
+          &end, &total_length)) {
+    GST_DEBUG_OBJECT (src,
+        "range = %" G_GINT64_FORMAT "-%" G_GINT64_FORMAT "/%" G_GINT64_FORMAT,
+        start, end, total_length);
+    if (src->opval != 0x00)
+      src->seekable = TRUE;
+
+    /* In case that DLNA mode but content size is unknown */
+    if (src->dlna_mode && !src->content_size) {
+      if (total_length != -1) {
+        src->content_size = total_length;
+        GST_DEBUG_OBJECT (src, "size = %" G_GUINT64_FORMAT, src->content_size);
+        gst_soup_http_src_duration_set_n_post (src);
+      }
+    }
+  }
+
+  /* report that we got headers along with content length;
+   * when using byte-ranges the content length is the size of the range
+   * we requested, not the full entity
+   */
+  g_array_insert_val (out_val_array, 0, src->content_size);
+  g_array_insert_val (out_val_array, 1, start);
+  g_array_insert_val (out_val_array, 2, end);
+  g_array_insert_val (out_val_array, 3, total_length);
+  g_signal_emit (G_OBJECT (src), soup_http_src_signals[GOT_HEADERS_SIGNAL], 0,
+      out_val_array);
+  /* when the signal returns, free the array */
+  g_array_free (out_val_array, TRUE);
 
   /* If the server reports Accept-Ranges: none we don't have to try
    * doing range requests at all
    */
-  if ((accept_ranges =
-          soup_message_headers_get_one (msg->response_headers,
-              "Accept-Ranges"))) {
-    if (g_ascii_strcasecmp (accept_ranges, "none") == 0)
-      src->seekable = FALSE;
+  if (src->opval == 0x111) {
+    if ((accept_ranges =
+            soup_message_headers_get_one (msg->response_headers,
+                "Accept-Ranges"))) {
+      if (g_ascii_strcasecmp (accept_ranges, "none") == 0)
+        src->seekable = FALSE;
+    }
   }
 
   /* Icecast stuff */
@@ -1513,8 +1893,12 @@ gst_soup_http_src_build_message (GstSoupHTTPSrc * src, const gchar * method)
         G_CALLBACK (gst_soup_http_src_restarted_cb), src);
   }
 
-  gst_soup_http_src_add_range_header (src, src->request_position,
-      src->stop_position);
+  if (src->time_seek_flag) {
+    gst_soup_http_src_add_time_seek_range_header (src, src->request_time);
+  } else {
+    gst_soup_http_src_add_range_header (src, src->request_position,
+        src->stop_position);
+  }
 
   gst_soup_http_src_add_extra_headers (src);
 
@@ -1584,14 +1968,14 @@ gst_soup_http_src_do_request (GstSoupHTTPSrc * src, const gchar * method)
   if (src->msg && src->request_position > 0) {
     gst_soup_http_src_add_range_header (src, src->request_position,
         src->stop_position);
-  } else if (src->msg && src->request_position == 0)
+  } else if (src->msg && src->request_position == 0) {
     soup_message_headers_remove (src->msg->request_headers, "Range");
+    src->read_position = src->request_position;
+  }
 
-  /* add_range_header() has the side effect of setting read_position to
-   * the requested position. This *needs* to be set regardless of having
-   * a message or not. Failure to do so would result in calculation being
-   * done with stale/wrong read position */
-  src->read_position = src->request_position;
+  if (src->msg && src->time_seek_flag) {
+    gst_soup_http_src_add_time_seek_range_header (src, src->request_time);
+  }
 
   if (!src->msg) {
     if (!gst_soup_http_src_build_message (src, method)) {
@@ -1606,9 +1990,30 @@ gst_soup_http_src_do_request (GstSoupHTTPSrc * src, const gchar * method)
 
   ret = gst_soup_http_src_send_message (src);
 
+  if (src->request_time != GST_CLOCK_TIME_NONE) {
+    if (ret == GST_FLOW_CUSTOM_ERROR &&
+        src->request_time &&
+        src->msg->status_code != SOUP_STATUS_OK &&
+        src->msg->status_code != SOUP_STATUS_PARTIAL_CONTENT) {
+      src->seekable = FALSE;
+      GST_ELEMENT_ERROR (src, RESOURCE, SEEK,
+          (_("Server does not support DLNA time-based seeking.")),
+          ("Server does not accept TimeSeekRange.dlna.org HTTP header, URL: %s",
+              src->location));
+      ret = GST_FLOW_ERROR;
+    }
+
+    src->request_time = GST_CLOCK_TIME_NONE;
+  }
+
   /* Check if Range header was respected. */
   if (ret == GST_FLOW_OK && src->request_position > 0 &&
       src->msg->status_code != SOUP_STATUS_PARTIAL_CONTENT) {
+    /* DTCP-IP DMS sets status code as SOUP_STATUS_OK
+     * better than SOUP_STATUS_PARTIAL_CONTENT. */
+    if (src->is_dtcp && src->msg->status_code == SOUP_STATUS_OK)
+      return ret;
+
     src->seekable = FALSE;
     GST_ELEMENT_ERROR_WITH_DETAILS (src, RESOURCE, SEEK,
         (_("Server does not support seeking.")),
@@ -1623,46 +2028,6 @@ gst_soup_http_src_do_request (GstSoupHTTPSrc * src, const gchar * method)
   return ret;
 }
 
-/*
- * Check if the bytes_read is above a certain threshold of the blocksize, if
- * that happens a few times in a row, increase the blocksize; Do the same in
- * the opposite direction to reduce the blocksize.
- */
-static void
-gst_soup_http_src_check_update_blocksize (GstSoupHTTPSrc * src,
-    gint64 bytes_read)
-{
-  guint blocksize = gst_base_src_get_blocksize (GST_BASE_SRC_CAST (src));
-
-  GST_LOG_OBJECT (src, "Checking to update blocksize. Read:%" G_GINT64_FORMAT
-      " blocksize:%u", bytes_read, blocksize);
-
-  if (bytes_read >= blocksize * GROW_BLOCKSIZE_LIMIT) {
-    src->reduce_blocksize_count = 0;
-    src->increase_blocksize_count++;
-
-    if (src->increase_blocksize_count >= GROW_BLOCKSIZE_COUNT) {
-      blocksize *= GROW_BLOCKSIZE_FACTOR;
-      GST_DEBUG_OBJECT (src, "Increased blocksize to %u", blocksize);
-      gst_base_src_set_blocksize (GST_BASE_SRC_CAST (src), blocksize);
-      src->increase_blocksize_count = 0;
-    }
-  } else if (bytes_read < blocksize * REDUCE_BLOCKSIZE_LIMIT) {
-    src->reduce_blocksize_count++;
-    src->increase_blocksize_count = 0;
-
-    if (src->reduce_blocksize_count >= REDUCE_BLOCKSIZE_COUNT) {
-      blocksize *= REDUCE_BLOCKSIZE_FACTOR;
-      blocksize = MAX (blocksize, src->minimum_blocksize);
-      GST_DEBUG_OBJECT (src, "Decreased blocksize to %u", blocksize);
-      gst_base_src_set_blocksize (GST_BASE_SRC_CAST (src), blocksize);
-      src->reduce_blocksize_count = 0;
-    }
-  } else {
-    src->reduce_blocksize_count = src->increase_blocksize_count = 0;
-  }
-}
-
 static void
 gst_soup_http_src_update_position (GstSoupHTTPSrc * src, gint64 bytes_read)
 {
@@ -1674,7 +2039,7 @@ gst_soup_http_src_update_position (GstSoupHTTPSrc * src, gint64 bytes_read)
     src->request_position = new_position;
   src->read_position = new_position;
 
-  if (src->have_size) {
+  if (src->have_size && src->content_size != 0) {
     if (new_position > src->content_size) {
       GST_DEBUG_OBJECT (src, "Got position previous estimated content size "
           "(%" G_GINT64_FORMAT " > %" G_GINT64_FORMAT ")", new_position,
@@ -1687,15 +2052,19 @@ gst_soup_http_src_update_position (GstSoupHTTPSrc * src, gint64 bytes_read)
       GST_DEBUG_OBJECT (src, "We're EOS now");
     }
   }
+
+  g_signal_emit (G_OBJECT (src), soup_http_src_signals[GOT_CHUNK_SIGNAL], 0,
+      (gsize) bytes_read);
 }
 
 static GstFlowReturn
 gst_soup_http_src_read_buffer (GstSoupHTTPSrc * src, GstBuffer ** outbuf)
 {
-  gssize read_bytes;
+  gsize read_bytes;
   GstMapInfo mapinfo;
   GstBaseSrc *bsrc;
   GstFlowReturn ret;
+  gboolean read_ret;
 
   bsrc = GST_BASE_SRC_CAST (src);
 
@@ -1710,10 +2079,10 @@ gst_soup_http_src_read_buffer (GstSoupHTTPSrc * src, GstBuffer ** outbuf)
     return GST_FLOW_ERROR;
   }
 
-  read_bytes =
-      g_input_stream_read (src->input_stream, mapinfo.data, mapinfo.size,
-      src->cancellable, NULL);
-  GST_DEBUG_OBJECT (src, "Read %" G_GSSIZE_FORMAT " bytes from http input",
+  read_ret =
+      g_input_stream_read_all (src->input_stream, mapinfo.data, mapinfo.size,
+      &read_bytes, src->cancellable, NULL);
+  GST_DEBUG_OBJECT (src, "Read %" G_GSIZE_FORMAT " bytes from http input",
       read_bytes);
 
   g_mutex_lock (&src->mutex);
@@ -1727,14 +2096,20 @@ gst_soup_http_src_read_buffer (GstSoupHTTPSrc * src, GstBuffer ** outbuf)
   gst_buffer_unmap (*outbuf, &mapinfo);
   if (read_bytes > 0) {
     gst_buffer_set_size (*outbuf, read_bytes);
-    GST_BUFFER_OFFSET (*outbuf) = bsrc->segment.position;
+
+    if (bsrc->segment.format == GST_FORMAT_TIME) {
+      GST_BUFFER_OFFSET (*outbuf) = src->read_position;
+      GST_LOG_OBJECT (src, "read position %" G_GUINT64_FORMAT,
+          src->read_position);
+    } else {
+      GST_BUFFER_OFFSET (*outbuf) = bsrc->segment.position;
+    }
+
     ret = GST_FLOW_OK;
     gst_soup_http_src_update_position (src, read_bytes);
 
     /* Got some data, reset retry counter */
     src->retry_count = 0;
-
-    gst_soup_http_src_check_update_blocksize (src, read_bytes);
 
     /* If we're at the end of a range request, read again to let libsoup
      * finalize the request. This allows to reuse the connection again later,
@@ -1743,23 +2118,24 @@ gst_soup_http_src_read_buffer (GstSoupHTTPSrc * src, GstBuffer ** outbuf)
     if (bsrc->segment.stop != -1
         && bsrc->segment.position + read_bytes >= bsrc->segment.stop) {
       guint8 tmp[128];
+      gssize remaining_bytes;
 
       g_object_unref (src->msg);
       src->msg = NULL;
       src->have_body = TRUE;
 
       /* This should return immediately as we're at the end of the range */
-      read_bytes =
+      remaining_bytes =
           g_input_stream_read (src->input_stream, tmp, sizeof (tmp),
           src->cancellable, NULL);
-      if (read_bytes > 0)
+      if (remaining_bytes > 0)
         GST_ERROR_OBJECT (src,
-            "Read %" G_GSIZE_FORMAT " bytes after end of range", read_bytes);
+            "Read %" G_GSSIZE_FORMAT " bytes after end of range",
+            remaining_bytes);
     }
   } else {
     gst_buffer_unref (*outbuf);
-    if (read_bytes < 0 ||
-        (src->have_size && src->read_position < src->content_size)) {
+    if (!read_ret || (src->have_size && src->read_position < src->content_size)) {
       /* Maybe the server disconnected, retry */
       ret = GST_FLOW_CUSTOM_ERROR;
     } else {
@@ -1787,7 +2163,7 @@ retry:
   g_mutex_lock (&src->mutex);
 
   /* Check for pending position change */
-  if (src->request_position != src->read_position) {
+  if (src->request_position != src->read_position || src->time_seek_flag) {
     if (src->input_stream) {
       g_input_stream_close (src->input_stream, src->cancellable, NULL);
       g_object_unref (src->input_stream);
@@ -1999,6 +2375,8 @@ gst_soup_http_src_is_seekable (GstBaseSrc * bsrc)
 
   gst_soup_http_src_check_seekable (src);
 
+  GST_INFO_OBJECT (src, "seekable : %d", src->seekable);
+
   return src->seekable;
 }
 
@@ -2009,6 +2387,20 @@ gst_soup_http_src_do_seek (GstBaseSrc * bsrc, GstSegment * segment)
 
   GST_DEBUG_OBJECT (src, "do_seek(%" G_GUINT64_FORMAT "-%" G_GUINT64_FORMAT
       ")", segment->start, segment->stop);
+
+  if ((segment->format == GST_FORMAT_TIME) && ((src->opval == 0x10)
+          || (src->opval == 0x11))) {
+    if (src->read_position == 0 && segment->start == 0) {
+      GST_DEBUG_OBJECT (src, "Ignore initial zero time seek");
+      return TRUE;
+    }
+
+    src->time_seek_flag = TRUE;
+    src->request_time = segment->start;
+
+    goto end;
+  }
+
   if (src->read_position == segment->start &&
       src->request_position == src->read_position &&
       src->stop_position == segment->stop) {
@@ -2021,12 +2413,25 @@ gst_soup_http_src_do_seek (GstBaseSrc * bsrc, GstSegment * segment)
 
   /* If we have no headers we don't know yet if it is seekable or not.
    * Store the start position and error out later if it isn't */
-  if (src->got_headers && !src->seekable) {
+  if (src->got_headers && (!src->seekable || src->opval == 0x00)) {
     GST_WARNING_OBJECT (src, "Not seekable");
     return FALSE;
   }
 
-  if (segment->rate < 0.0 || segment->format != GST_FORMAT_BYTES) {
+  if (src->is_dtcp) {
+    if (!(src->flagval & 0x100)) {
+      GST_WARNING_OBJECT (src, "Not supported Cleartext-Byte seek.");
+      return FALSE;
+    }
+  } else {
+    if ((src->opval == 0x00) || (src->opval == 0x10)) {
+      GST_WARNING_OBJECT (src, "Not Accepted seek segment, opval:0x%02x",
+          src->opval);
+      return FALSE;
+    }
+  }
+  /*  In the case of DLNA, should support negative rate for seek. */
+  if (segment->format != GST_FORMAT_BYTES) {
     GST_WARNING_OBJECT (src, "Invalid seek segment");
     return FALSE;
   }
@@ -2039,6 +2444,9 @@ gst_soup_http_src_do_seek (GstBaseSrc * bsrc, GstSegment * segment)
   /* Wait for create() to handle the jump in offset. */
   src->request_position = segment->start;
   src->stop_position = segment->stop;
+
+end:
+  src->last_seek_format = segment->format;
 
   return TRUE;
 }
@@ -2060,6 +2468,33 @@ gst_soup_http_src_query (GstBaseSrc * bsrc, GstQuery * query)
             src->redirection_permanent);
       }
       ret = TRUE;
+      break;
+    case GST_QUERY_DURATION:
+    {
+      GstFormat format;
+      gint64 duration = (gint64) src->content_size;
+
+      gst_query_parse_duration (query, &format, NULL);
+
+      if (format != GST_FORMAT_BYTES || !duration) {
+        GST_WARNING_OBJECT (src,
+            "duration query: false (format %s, duration %" G_GINT64_FORMAT ")",
+            gst_format_get_name (format), duration);
+
+        ret = FALSE;
+      } else {
+        GST_DEBUG_OBJECT (src, "duration query: true (duration %"
+            G_GINT64_FORMAT ")", duration);
+
+        gst_query_set_duration (query, format, duration);
+
+        ret = TRUE;
+      }
+
+      return ret;
+    }
+    case GST_QUERY_CUSTOM:
+      ret = gst_soup_http_src_handle_custom_query (src, query);
       break;
     default:
       ret = FALSE;
@@ -2179,4 +2614,172 @@ gst_soup_http_src_uri_handler_init (gpointer g_iface, gpointer iface_data)
   iface->get_protocols = gst_soup_http_src_uri_get_protocols;
   iface->get_uri = gst_soup_http_src_uri_get_uri;
   iface->set_uri = gst_soup_http_src_uri_set_uri;
+}
+
+static void
+gst_soup_http_src_duration_set_n_post (GstSoupHTTPSrc * src)
+{
+  GstBaseSrc *bsrc;
+
+  if (!src->content_size) {
+    GST_DEBUG_OBJECT (src, "invalid: content size is zero\n");
+    return;
+  }
+
+  bsrc = GST_BASE_SRC_CAST (src);
+
+  if (bsrc->segment.format != GST_FORMAT_BYTES
+      && bsrc->segment.format != GST_FORMAT_TIME) {
+    GST_DEBUG_OBJECT (src,
+        "invalid: src format. src is not bytes and not time format\n");
+    return;
+  }
+  if (bsrc->segment.format == GST_FORMAT_TIME) {
+    bsrc->segment.duration = -1;
+    /* This change is required for MP4(qtdemux) */
+    bsrc->segment.base = src->request_position;
+  } else {
+    bsrc->segment.duration = src->content_size;
+    src->have_size = TRUE;
+  }
+  gst_element_post_message (GST_ELEMENT (src),
+      gst_message_new_duration_changed (GST_OBJECT (src)));
+}
+
+static gboolean
+gst_soup_http_src_add_time_seek_range_header (GstSoupHTTPSrc * src,
+    guint64 offset)
+{
+  gchar buf[64];
+
+  gint rc;
+
+  soup_message_headers_remove (src->msg->request_headers,
+      "TimeSeekRange.dlna.org");
+  if (offset != GST_CLOCK_TIME_NONE) {
+    rc = g_snprintf (buf, sizeof (buf), "npt=%" GST_NPT_TIME_FORMAT "-",
+        GST_NPT_TIME_ARGS (offset));
+    if (rc > sizeof (buf) || rc < 0)
+      return FALSE;
+    soup_message_headers_append (src->msg->request_headers,
+        "TimeSeekRange.dlna.org", buf);
+  }
+  src->time_seek_flag = FALSE;
+  return TRUE;
+}
+
+static gboolean
+gst_soup_http_src_add_cleartext_range_header (GstSoupHTTPSrc * src,
+    guint64 offset)
+{
+  const gchar *range_header = "Range.dtcp.com";
+  gchar buf[64];
+  gint rc;
+
+  soup_message_headers_remove (src->msg->request_headers, range_header);
+  if (offset) {
+    rc = g_snprintf (buf, sizeof (buf), "bytes=%" G_GUINT64_FORMAT "-", offset);
+    if (rc > sizeof (buf) || rc < 0)
+      return FALSE;
+    soup_message_headers_append (src->msg->request_headers, range_header, buf);
+  }
+  src->read_position = src->request_position;
+  return TRUE;
+}
+
+static gboolean
+gst_soup_http_src_handle_custom_query (GstSoupHTTPSrc * src, GstQuery * query)
+{
+  SoupSession *session;
+  SoupMessage *msg = NULL;
+  GstStructure *structure;
+  gchar *range;
+  goffset content_length = 0;
+  const gchar *content_range = "";
+
+  structure = (GstStructure *) gst_query_get_structure (query);
+
+  /* Validate query */
+  if ((!gst_structure_has_name (structure, "smart-properties")) &&
+      (!gst_structure_has_name (structure, "vdec-buffer-ts")) &&
+      (!gst_structure_has_name (structure, "CleartextSeekInfo"))) {
+    GST_WARNING_OBJECT (src, "Unknown custom query (%s)",
+        gst_structure_get_name (structure));
+    return FALSE;
+  }
+
+  if (src->is_dtcp && !(src->flagval & 0x100)) {
+    GST_WARNING_OBJECT (src,
+        "This source does not support Cleartext-Byte seek.");
+    return FALSE;
+  }
+
+  if (!gst_structure_get (structure,
+          "Range.dtcp.com", G_TYPE_STRING, &range, NULL))
+    return FALSE;
+
+  /* Get requested Cleartext-Byte seek potision */
+  if (!g_str_has_prefix (range, "bytes="))
+    return FALSE;
+  sscanf (range + strlen ("bytes="), "%" G_GUINT64_FORMAT "%*c%*u",
+      &src->request_cb_position);
+
+  /* Prepare HTTP HEAD message */
+  msg = soup_message_new (SOUP_METHOD_HEAD, src->location);
+
+  soup_message_headers_append (msg->request_headers, "Connection", "close");
+  soup_message_headers_append (msg->request_headers, "Range.dtcp.com", range);
+
+  /* Send HTTP HEAD message */
+  session = soup_session_sync_new_with_options (SOUP_SESSION_TIMEOUT, 3, NULL);
+
+  /* Set the flag for cancelling current transfer */
+  src->cancel = TRUE;
+  /* This function will block until received response */
+  soup_session_send_message (session, msg);
+  src->cancel = FALSE;
+
+  g_object_unref (session);
+
+  if (msg->status_code != SOUP_STATUS_OK) {
+    g_object_unref (msg);
+    return FALSE;
+  }
+
+  /* Collect information from the response */
+  content_length =
+      soup_message_headers_get_content_length (msg->response_headers);
+  content_range =
+      soup_message_headers_get_one (msg->response_headers,
+      "Content-Range.dtcp.com");
+
+  /* Make query reply */
+  gst_structure_set (structure,
+      "CONTENT-LENGTH", G_TYPE_UINT64, content_length,
+      "Content-Range.dtcp.com", G_TYPE_STRING, content_range, NULL);
+
+  g_object_unref (msg);
+  return TRUE;
+}
+
+static gboolean
+gst_soup_http_src_query_dtcp_seekable (GstBaseSrc * bsrc)
+{
+  GstQuery *query;
+  gboolean byte_seekable = FALSE;
+  gboolean time_seekable = FALSE;
+
+  /* check byte seekable */
+  query = gst_query_new_seeking (GST_FORMAT_BYTES);
+  if (gst_pad_peer_query (bsrc->srcpad, query))
+    gst_query_parse_seeking (query, NULL, &byte_seekable, NULL, NULL);
+  gst_query_unref (query);
+
+  /* check time seekable */
+  query = gst_query_new_seeking (GST_FORMAT_TIME);
+  if (gst_pad_peer_query (bsrc->srcpad, query))
+    gst_query_parse_seeking (query, NULL, &time_seekable, NULL, NULL);
+  gst_query_unref (query);
+
+  return (byte_seekable || time_seekable);
 }

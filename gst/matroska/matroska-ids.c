@@ -67,6 +67,31 @@ gst_matroska_track_init_video_context (GstMatroskaTrackContext ** p_context)
   video_context->colorimetry.primaries = GST_VIDEO_COLOR_PRIMARIES_UNKNOWN;
 
 
+  /* HDR metadata */
+  video_context->matrix_coefficients = 2;
+  video_context->bits_per_channel = 0;
+  video_context->chroma_subsampling_horz = 0;
+  video_context->chroma_subsampling_vert = 0;
+  video_context->cb_subsampling_horz = 0;
+  video_context->cb_subsampling_vert = 0;
+  video_context->chroma_siting_horz = 0;
+  video_context->chroma_siting_vert = 0;
+  video_context->range = 0;
+  video_context->transfer_characteristics = 2;
+  video_context->primaries = 2;
+  video_context->max_CLL = 0;
+  video_context->max_FALL = 0;
+  video_context->primaryR_chromaticityX = 0.0;
+  video_context->primaryR_chromaticityY = 0.0;
+  video_context->primaryG_chromaticityX = 0.0;
+  video_context->primaryG_chromaticityY = 0.0;
+  video_context->primaryB_chromaticityX = 0.0;
+  video_context->primaryB_chromaticityY = 0.0;
+  video_context->white_point_chromaticityX = 0.0;
+  video_context->white_point_chromaticityY = 0.0;
+  video_context->luminance_max = 0.0;
+  video_context->luminance_min = 0.0;
+
   return TRUE;
 }
 

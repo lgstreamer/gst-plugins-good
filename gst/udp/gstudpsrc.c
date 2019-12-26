@@ -424,7 +424,7 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
 #define UDP_DEFAULT_URI                 "udp://"UDP_DEFAULT_MULTICAST_GROUP":"G_STRINGIFY(UDP_DEFAULT_PORT)
 #define UDP_DEFAULT_CAPS                NULL
 #define UDP_DEFAULT_SOCKET              NULL
-#define UDP_DEFAULT_BUFFER_SIZE		0
+#define UDP_DEFAULT_BUFFER_SIZE         0
 #define UDP_DEFAULT_TIMEOUT             0
 #define UDP_DEFAULT_SKIP_FIRST_BYTES	0
 #define UDP_DEFAULT_CLOSE_SOCKET       TRUE
@@ -445,6 +445,7 @@ enum
   PROP_CAPS,
   PROP_SOCKET,
   PROP_BUFFER_SIZE,
+  PROP_FORCE_BUFFER_SIZE,
   PROP_TIMEOUT,
   PROP_SKIP_FIRST_BYTES,
   PROP_CLOSE_SOCKET,
@@ -542,6 +543,12 @@ gst_udpsrc_class_init (GstUDPSrcClass * klass)
       g_param_spec_int ("buffer-size", "Buffer Size",
           "Size of the kernel receive buffer in bytes, 0=default", 0, G_MAXINT,
           UDP_DEFAULT_BUFFER_SIZE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (G_OBJECT_CLASS (klass),
+      PROP_FORCE_BUFFER_SIZE, g_param_spec_int ("force-buffer-size",
+          "Force Buffer Size",
+          "FORCE Size of the kernel receive buffer in bytes, 0=default", 0,
+          G_MAXINT, UDP_DEFAULT_BUFFER_SIZE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (G_OBJECT_CLASS (klass), PROP_TIMEOUT,
       g_param_spec_uint64 ("timeout", "Timeout",
           "Post a message after timeout nanoseconds (0 = disabled)", 0,
@@ -633,6 +640,7 @@ gst_udpsrc_init (GstUDPSrc * udpsrc)
   udpsrc->socket = UDP_DEFAULT_SOCKET;
   udpsrc->multi_iface = g_strdup (UDP_DEFAULT_MULTICAST_IFACE);
   udpsrc->buffer_size = UDP_DEFAULT_BUFFER_SIZE;
+  udpsrc->force_buffer_size = UDP_DEFAULT_BUFFER_SIZE;
   udpsrc->timeout = UDP_DEFAULT_TIMEOUT;
   udpsrc->skip_first_bytes = UDP_DEFAULT_SKIP_FIRST_BYTES;
   udpsrc->close_socket = UDP_DEFAULT_CLOSE_SOCKET;
@@ -1109,6 +1117,9 @@ gst_udpsrc_set_property (GObject * object, guint prop_id, const GValue * value,
     case PROP_BUFFER_SIZE:
       udpsrc->buffer_size = g_value_get_int (value);
       break;
+    case PROP_FORCE_BUFFER_SIZE:
+      udpsrc->force_buffer_size = udpsrc->buffer_size = g_value_get_int (value);
+      break;
     case PROP_PORT:
       udpsrc->port = g_value_get_int (value);
       g_free (udpsrc->uri);
@@ -1401,14 +1412,15 @@ gst_udpsrc_open (GstUDPSrc * src)
 
   {
     gint val = 0;
+    GError *opt_err = NULL;
 
     if (src->buffer_size != 0) {
-      GError *opt_err = NULL;
-
+      
       GST_INFO_OBJECT (src, "setting udp buffer of %d bytes", src->buffer_size);
+
       /* set buffer size, Note that on Linux this is typically limited to a
-       * maximum of around 100K. Also a minimum of 128 bytes is required on
-       * Linux. */
+       * maximum of around 100K. Also a minimum of 128 bytes is required on Linux.
+       * You can forcefully set the buffer_size by using force-buffer-size property */
       if (!g_socket_set_option (src->used_socket, SOL_SOCKET, SO_RCVBUF,
               src->buffer_size, &opt_err)) {
         GST_ELEMENT_WARNING (src, RESOURCE, SETTINGS, (NULL),
@@ -1428,6 +1440,28 @@ gst_udpsrc_open (GstUDPSrc * src)
       GST_INFO_OBJECT (src, "have udp buffer of %d bytes", val);
     } else {
       GST_DEBUG_OBJECT (src, "could not get udp buffer size");
+    }
+
+    /* the value of the receive buffer is less than the set buffer_size.
+     * Try to set the buffer_size by using SO_RCVBUFFORCE */
+    if (val < src->buffer_size) {
+      GST_INFO_OBJECT (src, "forcibly setting udp buffer of %d bytes",
+          src->buffer_size);
+      if (!g_socket_set_option (src->used_socket, SOL_SOCKET, SO_RCVBUFFORCE,
+              src->buffer_size, &opt_err)) {
+        GST_ELEMENT_WARNING (src, RESOURCE, SETTINGS, (NULL),
+            ("Could not create forcibly a buffer of requested %d bytes: %s",
+                src->buffer_size, opt_err->message));
+        g_error_free (opt_err);
+        opt_err = NULL;
+      } else {
+        if (g_socket_get_option (src->used_socket, SOL_SOCKET, SO_RCVBUF, &val,
+                NULL)) {
+          GST_INFO_OBJECT (src, "finally have udp buffer of %d bytes", val);
+        } else {
+          GST_DEBUG_OBJECT (src, "could not get udp buffer size");
+        }
+      }
     }
   }
 

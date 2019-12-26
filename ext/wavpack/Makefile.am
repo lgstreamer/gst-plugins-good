@@ -5,7 +5,10 @@ libgstwavpack_la_SOURCES = \
 				gstwavpackcommon.c \
 				gstwavpackdec.c \
 				gstwavpackenc.c \
-				gstwavpackstreamreader.c
+				gstwavpackstreamreader.c \
+				gstwvccombiner.c \
+				gstwvcmeta.c \
+				gstwvfilesrc.c
 
 libgstwavpack_la_CFLAGS = $(GST_PLUGINS_BASE_CFLAGS) \
 				$(GST_BASE_CFLAGS) $(GST_CFLAGS) $(WAVPACK_CFLAGS)
@@ -17,5 +20,7 @@ noinst_HEADERS = \
 		gstwavpackdec.h \
 		gstwavpackenc.h \
 		gstwavpackcommon.h \
-		gstwavpackstreamreader.h
-
+		gstwavpackstreamreader.h \
+		gstwvccombiner.h \
+		gstwvcmeta.h \
+		gstwvfilesrc.h

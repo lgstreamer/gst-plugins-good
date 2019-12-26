@@ -182,13 +182,13 @@ qtmux_sinkpad_query (GstPad * pad, GstObject * parent, GstQuery * query)
 }
 
 static GstElement *
-setup_qtmux (GstStaticPadTemplate * srctemplate, const gchar * sinkname,
-    gboolean seekable)
+setup_qtmux (const gchar * element, GstStaticPadTemplate * srctemplate,
+    const gchar * sinkname, gboolean seekable)
 {
   GstElement *qtmux;
 
   GST_DEBUG ("setup_qtmux");
-  qtmux = gst_check_setup_element ("qtmux");
+  qtmux = gst_check_setup_element (element);
   mysrcpad = setup_src_pad (qtmux, srctemplate, sinkname);
   mysinkpad = gst_check_setup_sink_pad (qtmux, &sinktemplate);
 
@@ -228,7 +228,7 @@ check_qtmux_pad (GstStaticPadTemplate * srctemplate, const gchar * sinkname,
   guint8 data2[4] = "moov";
   GstSegment segment;
 
-  qtmux = setup_qtmux (srctemplate, sinkname, TRUE);
+  qtmux = setup_qtmux ("qtmux", srctemplate, sinkname, TRUE);
   g_object_set (qtmux, "dts-method", dts_method, NULL);
   fail_unless (gst_element_set_state (qtmux,
           GST_STATE_PLAYING) == GST_STATE_CHANGE_SUCCESS,
@@ -311,14 +311,14 @@ check_qtmux_pad_fragmented (GstStaticPadTemplate * srctemplate,
   GstCaps *caps;
   int num_buffers;
   int i;
-  guint8 data0[12] = "\000\000\000\024ftypqt  ";
+  guint8 data0[12] = "\000\000\000\040ftypmp42";
   guint8 data1[4] = "mdat";
   guint8 data2[4] = "moov";
   guint8 data3[4] = "moof";
   guint8 data4[4] = "mfra";
   GstSegment segment;
 
-  qtmux = setup_qtmux (srctemplate, sinkname, !streamable);
+  qtmux = setup_qtmux ("mp4mux", srctemplate, sinkname, !streamable);
   g_object_set (qtmux, "dts-method", dts_method, NULL);
   g_object_set (qtmux, "fragment-duration", 2000, NULL);
   g_object_set (qtmux, "streamable", streamable, NULL);
@@ -548,7 +548,8 @@ GST_END_TEST;
 
 GST_START_TEST (test_reuse)
 {
-  GstElement *qtmux = setup_qtmux (&srcvideotemplate, "video_%u", TRUE);
+  GstElement *qtmux =
+      setup_qtmux ("qtmux", &srcvideotemplate, "video_%u", TRUE);
   GstBuffer *inbuffer;
   GstCaps *caps;
   GstSegment segment;

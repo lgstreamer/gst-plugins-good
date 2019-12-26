@@ -248,12 +248,13 @@ atom_uuid_free (AtomUUID * data)
 }
 
 static void
-atom_ftyp_init (AtomFTYP * ftyp, guint32 major, guint32 version, GList * brands)
+atom_brands_init (AtomFTYP * ftyp, guint32 fourcc, guint32 major,
+    guint32 version, GList * brands)
 {
   gint index;
   GList *it = NULL;
 
-  atom_header_set (&ftyp->header, FOURCC_ftyp, 16, 0);
+  atom_header_set (&ftyp->header, fourcc, 16, 0);
   ftyp->major_brand = major;
   ftyp->version = version;
 
@@ -268,6 +269,12 @@ atom_ftyp_init (AtomFTYP * ftyp, guint32 major, guint32 version, GList * brands)
   }
 }
 
+static void
+atom_ftyp_init (AtomFTYP * ftyp, guint32 major, guint32 version, GList * brands)
+{
+  atom_brands_init (ftyp, FOURCC_ftyp, major, version, brands);
+}
+
 AtomFTYP *
 atom_ftyp_new (AtomsContext * context, guint32 major, guint32 version,
     GList * brands)
@@ -278,6 +285,22 @@ atom_ftyp_new (AtomsContext * context, guint32 major, guint32 version,
   return ftyp;
 }
 
+static void
+atom_styp_init (AtomFTYP * ftyp, guint32 major, guint32 version, GList * brands)
+{
+  atom_brands_init (ftyp, FOURCC_styp, major, version, brands);
+}
+
+AtomFTYP *
+atom_styp_new (AtomsContext * context, guint32 major, guint32 version,
+    GList * brands)
+{
+  AtomFTYP *ftyp = g_new0 (AtomFTYP, 1);
+
+  atom_styp_init (ftyp, major, version, brands);
+  return ftyp;
+}
+
 void
 atom_ftyp_free (AtomFTYP * ftyp)
 {
@@ -285,6 +308,57 @@ atom_ftyp_free (AtomFTYP * ftyp)
   g_free (ftyp->compatible_brands);
   ftyp->compatible_brands = NULL;
   g_free (ftyp);
+}
+
+static void
+atom_sidx_init (AtomSIDX * sidx, guint32 reference_id, guint64 dts,
+    guint32 timescale, guint64 earlist_pts, guint64 first_offset)
+{
+  guint8 flags[3] = { 0, 0, 0 };
+
+  atom_full_init (&sidx->header, FOURCC_sidx, 0, 0, 0, flags);
+  sidx->ref_id = reference_id;
+  sidx->timescale = timescale;
+
+  /* auto-use 64 bits if needed */
+  if (dts > G_MAXUINT32)
+    sidx->header.version = 1;
+
+  if (sidx->header.version == 0) {
+    sidx->earlist_pts = (guint32) earlist_pts;
+    sidx->first_offset = (guint32) first_offset;
+  } else {
+    sidx->earlist_pts = earlist_pts;
+    sidx->first_offset = first_offset;
+  }
+
+  sidx->reserved = 0;
+  //FIXME: need to fix reserve size
+  atom_array_init (&sidx->entries, 512);
+}
+
+AtomSIDX *
+atom_sidx_new (AtomsContext * context, guint32 reference_id, guint64 dts,
+    guint32 timescale, guint64 earlist_pts, guint64 first_offset)
+{
+  AtomSIDX *sidx = g_new0 (AtomSIDX, 1);
+
+  atom_sidx_init (sidx, reference_id, dts, timescale,
+      earlist_pts, first_offset);
+  return sidx;
+}
+
+void
+atom_sidx_free (AtomSIDX * sidx)
+{
+  atom_full_clear (&sidx->header);
+  atom_array_clear (&sidx->entries);
+  sidx->ref_id = 0;
+  sidx->timescale = 0;
+  sidx->earlist_pts = 0;
+  sidx->first_offset = 0;
+  sidx->reserved = 0;
+  g_free (sidx);
 }
 
 static void
@@ -2987,6 +3061,57 @@ atom_wave_copy_data (AtomWAVE * wave, guint8 ** buffer,
   return *offset - original_offset;
 }
 
+guint64
+atom_sidx_copy_data (AtomSIDX * sidx, guint8 ** buffer, guint64 * size,
+    guint64 * offset)
+{
+  guint64 original_offset = *offset;
+  guint32 i;
+  SIDXEntry *entry;
+  guint version;
+
+  if (!atom_full_copy_data (&sidx->header, buffer, size, offset)) {
+    return 0;
+  }
+
+  prop_copy_uint32 (sidx->ref_id, buffer, size, offset);
+  prop_copy_uint32 (sidx->timescale, buffer, size, offset);
+
+  version = atom_full_get_version (&(sidx->header));
+  if (version) {
+    prop_copy_uint64 (sidx->earlist_pts, buffer, size, offset);
+    prop_copy_uint64 (sidx->first_offset, buffer, size, offset);
+  } else {
+    prop_copy_uint32 ((guint32) sidx->earlist_pts, buffer, size, offset);
+    prop_copy_uint32 ((guint32) sidx->first_offset, buffer, size, offset);
+  }
+
+  prop_copy_uint16 (sidx->reserved, buffer, size, offset);
+  prop_copy_uint16 (atom_array_get_len (&sidx->entries), buffer, size, offset);
+
+  /* minimize realloc */
+  prop_copy_ensure_buffer (buffer, size, offset,
+      12 * atom_array_get_len (&sidx->entries));
+
+  for (i = 0; i < atom_array_get_len (&sidx->entries); ++i) {
+    guint32 tmp;
+    entry = &atom_array_index (&sidx->entries, i);
+
+    tmp = ((entry->ref_type & 1) << 31);
+    tmp |= (entry->ref_size) & 0x7fffffff;
+    prop_copy_uint32 (tmp, buffer, size, offset);
+    prop_copy_uint32 (entry->subsegment_duration, buffer, size, offset);
+    tmp = ((entry->start_with_sap & 1) << 31);
+    tmp |= ((entry->sap_type & 0x7) << 28);
+    tmp |= (entry->sap_delta_time) & 0x0fffffff;
+    prop_copy_uint32 (tmp, buffer, size, offset);
+  }
+
+  atom_write_size (buffer, size, offset, original_offset);
+  return *offset - original_offset;
+}
+
+
 /* -- end of copy data functions -- */
 
 /* -- general functions, API and support functions */
@@ -3139,6 +3264,23 @@ atom_stbl_add_ctts_entry (AtomSTBL * stbl, guint32 nsamples, guint32 offset)
     stbl->ctts = atom_ctts_new ();
   }
   atom_ctts_add_entry (stbl->ctts, nsamples, offset);
+}
+
+void
+atom_sidx_add_entry (AtomSIDX * sidx, gboolean ref_type, guint32 ref_size,
+    guint32 sub_duration, gboolean start_with_sap, guint8 sap_type,
+    guint32 sap_delta_time)
+{
+  SIDXEntry entry;
+
+  entry.ref_type = ref_type;
+  entry.ref_size = ref_size;
+  entry.subsegment_duration = sub_duration;
+  entry.start_with_sap = start_with_sap;
+  entry.sap_type = sap_type;
+  entry.sap_delta_time = sap_delta_time;
+
+  atom_array_append (&sidx->entries, entry, 256);
 }
 
 void
@@ -5589,6 +5731,26 @@ build_uuid_xmp_atom (GstBuffer * xmp_data)
   uuid->data = g_malloc (size);
   uuid->datalen = size;
   gst_buffer_extract (xmp_data, 0, uuid->data, size);
+
+  return build_atom_info_wrapper ((Atom *) uuid, atom_uuid_copy_data,
+      atom_uuid_free);
+}
+
+AtomInfo *
+build_uuid_dvr_atom (void)
+{
+  AtomUUID *uuid;
+
+  /* uuid 4747982f-82a3-44a8-bb1d-a8c2ba5dcf9d
+     NOTE: it's big-edian */
+  static const guint8 dvr_uuid[] = { 0x47, 0x47, 0x98, 0x2f,
+    0x82, 0xa3, 0x44, 0xa8,
+    0xbb, 0x1d, 0xa8, 0xc2,
+    0xba, 0x5d, 0xcf, 0x9d
+  };
+
+  uuid = atom_uuid_new ();
+  memcpy (uuid->uuid, dvr_uuid, 16);
 
   return build_atom_info_wrapper ((Atom *) uuid, atom_uuid_copy_data,
       atom_uuid_free);

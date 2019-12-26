@@ -2,6 +2,13 @@ plugin_LTLIBRARIES = libgstvideo4linux2.la
 
 include $(top_srcdir)/common/gst-glib-gen.mak
 
+if USE_LINUX_EXT
+SCALERSRC_FILES = gstv4l2scalerobject.c \
+		gstv4l2scalersrc.c
+else
+SCALERSRC_FILES =
+endif
+
 libgstvideo4linux2_la_SOURCES = gstv4l2.c \
 				gstv4l2allocator.c \
 				gstv4l2colorbalance.c \
@@ -25,7 +32,8 @@ libgstvideo4linux2_la_SOURCES = gstv4l2.c \
 				v4l2-utils.c \
 				tuner.c \
 				tunerchannel.c \
-				tunernorm.c
+				tunernorm.c \
+				$(SCALERSRC_FILES)
 
 libgstvideo4linux2_la_CFLAGS =   $(GST_PLUGINS_BASE_CFLAGS) \
 				 $(GST_BASE_CFLAGS) \
@@ -54,6 +62,8 @@ noinst_HEADERS = \
 	gstv4l2colorbalance.h \
 	gstv4l2deviceprovider.h \
 	gstv4l2object.h \
+	gstv4l2scalerobject.h \
+	gstv4l2scalersrc.h \
 	gstv4l2sink.h \
 	gstv4l2src.h \
 	gstv4l2radio.h \

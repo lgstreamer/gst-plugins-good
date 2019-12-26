@@ -136,6 +136,14 @@ struct _GstQTPad
   gint64 fragment_duration;
   /* optional fragment index book-keeping */
   AtomTFRA *tfra;
+  /* List of GstForceKeyUnit event requesting a new fragmet for this fragment */
+  GList *forcekeyunit_events;
+  GstClockTime next_fragment_ts;
+  gboolean first_fragment;
+
+  /* for segmented dash format */
+  gboolean segment_start;
+  gint64 segment_duration;
 
   /* Set when tags are received, cleared when written to moov */
   gboolean tags_changed;
@@ -158,6 +166,11 @@ struct _GstQTPad
   GstAdapter *raw_audio_adapter;
   guint64 raw_audio_adapter_offset;
   GstClockTime raw_audio_adapter_pts;
+
+  /* dash unique atom box for fragment index book-keeping */
+  AtomSIDX *sidx;
+  
+  guint32 subsegment_duration;
 };
 
 typedef enum _GstQTMuxState
@@ -228,6 +241,16 @@ struct _GstQTMux
   /* Set when tags are received, cleared when written to moov */
   gboolean tags_changed;
 
+  /* Header buffers */
+  GstBuffer *prefix_buf;
+  GstBuffer *ftyp_buf;
+  GstBuffer *post_ftyp_align_free_atom_buf;
+  GstBuffer *empty_free_atom_buf;
+  GstBuffer *moov_buf;
+  GstBuffer *moov_free_ping_atom_buf;
+  GstBuffer *moov_free_pong_atom_buf;
+  GstBuffer *extra_atoms_buf;
+
   /* fragmented file index */
   AtomMFRA *mfra;
 
@@ -256,6 +279,10 @@ struct _GstQTMux
    * seek to rewrite headers - only valid for fragmented
    * mode. */
   gboolean streamable;
+  gint fragment_method;
+
+  /* for segmented dash format */
+  guint32 segment_duration;
 
   /* Requested target maximum duration */
   GstClockTime reserved_max_duration;
@@ -291,11 +318,24 @@ struct _GstQTMux
 
   /* for request pad naming */
   guint video_pads, audio_pads, subtitle_pads;
+
+  /* for send dvr encryption uuid atom */
+  gboolean dvr_encryption;
+
+  /* dash unique atom box for fragment index book-keeping */
+  AtomSIDX *sidx;
+  /* position of sidx atom header (for later updating data) in
+   * fragmented and segmented dash format */
+  guint64 sidx_pos;
+  guint32 reserved_sidx_size;
 };
 
 struct _GstQTMuxClass
 {
   GstElementClass parent_class;
+
+  /* signals */
+  void (*send_header) (GstQTMux *qtmux);
 
   GstQTMuxFormat format;
 };

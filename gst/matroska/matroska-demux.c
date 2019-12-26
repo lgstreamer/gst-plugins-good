@@ -83,11 +83,16 @@ enum
   PROP_0,
   PROP_METADATA,
   PROP_STREAMINFO,
-  PROP_MAX_GAP_TIME
+  PROP_MAX_GAP_TIME,
+  PROP_THUMBNAIL_MODE
 };
 
-#define  DEFAULT_MAX_GAP_TIME      (2 * GST_SECOND)
+#define  DEFAULT_MAX_GAP_TIME      (60 * GST_SECOND)
 #define  INVALID_DATA_THRESHOLD    (2 * 1024 * 1024)
+
+#define  IS_HIGH_SPEED_TRICK(e) \
+ (((e)->is_higher_than_FHD && (e)->common.segment.rate == 2) \
+ ||((e)->common.segment.rate < 1.0)||((e)->common.segment.rate > 2.0))
 
 static GstStaticPadTemplate sink_templ = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
@@ -174,12 +179,8 @@ static GstCaps
 static void gst_matroska_demux_reset (GstElement * element);
 static gboolean perform_seek_to_offset (GstMatroskaDemux * demux,
     gdouble rate, guint64 offset, guint32 seqnum, GstSeekFlags flags);
-
-/* gobject functions */
-static void gst_matroska_demux_set_property (GObject * object,
-    guint prop_id, const GValue * value, GParamSpec * pspec);
-static void gst_matroska_demux_get_property (GObject * object,
-    guint prop_id, GValue * value, GParamSpec * pspec);
+static gboolean perform_seek_to_keyframe_offset (GstMatroskaDemux *
+    demux, gdouble rate, guint64 offset);
 
 GType gst_matroska_demux_get_type (void);
 #define parent_class gst_matroska_demux_parent_class
@@ -205,15 +206,6 @@ gst_matroska_demux_class_init (GstMatroskaDemuxClass * klass)
       "Matroska demuxer");
 
   gobject_class->finalize = gst_matroska_demux_finalize;
-
-  gobject_class->get_property = gst_matroska_demux_get_property;
-  gobject_class->set_property = gst_matroska_demux_set_property;
-
-  g_object_class_install_property (gobject_class, PROP_MAX_GAP_TIME,
-      g_param_spec_uint64 ("max-gap-time", "Maximum gap time",
-          "The demuxer sends out segment events for skipping "
-          "gaps longer than this (0 = disabled).", 0, G_MAXUINT64,
-          DEFAULT_MAX_GAP_TIME, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gstelement_class->change_state =
       GST_DEBUG_FUNCPTR (gst_matroska_demux_change_state);
@@ -266,6 +258,7 @@ gst_matroska_demux_init (GstMatroskaDemux * demux)
   GST_OBJECT_FLAG_SET (demux, GST_ELEMENT_FLAG_INDEXABLE);
 
   demux->flowcombiner = gst_flow_combiner_new ();
+  demux->thumbnail_mode = FALSE;
 
   /* finish off */
   gst_matroska_demux_reset (GST_ELEMENT (demux));
@@ -316,6 +309,7 @@ gst_matroska_demux_reset (GstElement * element)
   demux->requested_seek_time = GST_CLOCK_TIME_NONE;
   demux->seek_offset = -1;
   demux->building_index = FALSE;
+  demux->seek_rate = 1.0;
   if (demux->seek_event) {
     gst_event_unref (demux->seek_event);
     demux->seek_event = NULL;
@@ -329,10 +323,20 @@ gst_matroska_demux_reset (GstElement * element)
     demux->new_segment = NULL;
   }
 
+  demux->h264_codec = -1;
   demux->invalid_duration = FALSE;
 
   demux->cached_length = G_MAXUINT64;
 
+  demux->keyframe_push_done = FALSE;
+  demux->is_higher_than_FHD = FALSE;
+  demux->has_audio = FALSE;
+  demux->audio_frame_push_ref = 0;
+  demux->audio_frame_push_check = 0;
+  demux->audio_frame_push_done = FALSE;
+  demux->is_rate_changed = TRUE;
+  demux->scan_next_cluster_push = FALSE;
+  demux->is_flushing = FALSE;
   gst_flow_combiner_clear (demux->flowcombiner);
 }
 
@@ -391,6 +395,7 @@ gst_matroska_demux_add_stream_headers_to_caps (GstMatroskaDemux * demux,
   g_value_unset (&buf_val);
 }
 
+#if 0
 static GstFlowReturn
 gst_matroska_demux_parse_colour (GstMatroskaDemux * demux, GstEbmlRead * ebml,
     GstMatroskaTrackVideoContext * video_context)
@@ -571,6 +576,403 @@ gst_matroska_demux_parse_colour (GstMatroskaDemux * demux, GstEbmlRead * ebml,
 
 beach:
   DEBUG_ELEMENT_STOP (demux, ebml, "TrackVideoColour", ret);
+
+  return ret;
+}
+#endif
+
+static GstFlowReturn
+gst_matroska_demux_parse_masteringmetadata (GstMatroskaDemux * demux,
+    GstEbmlRead * ebml, GstMatroskaTrackVideoContext * videocontext)
+{
+  GstFlowReturn ret = GST_FLOW_OK;
+  guint32 id;
+
+  DEBUG_ELEMENT_START (demux, ebml, "MasteringMetaData");
+
+  if ((ret = gst_ebml_read_master (ebml, &id)) != GST_FLOW_OK) {
+    DEBUG_ELEMENT_STOP (demux, ebml, "MasteringMetaData", ret);
+    return ret;
+  }
+
+  while (ret == GST_FLOW_OK && gst_ebml_read_has_remaining (ebml, 1, TRUE)) {
+    if ((ret = gst_ebml_peek_id (ebml, &id)) != GST_FLOW_OK)
+      break;
+
+    switch (id) {
+      case GST_MATROSKA_ID_PRIMARYRCHROMATICITYX:{
+        gdouble num;
+
+        if ((ret = gst_ebml_read_float (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num < 0.0 || num > 1.0) {
+          GST_WARNING_OBJECT (demux, "Invalid PrimaryRChromaticityX %lf", num);
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "PrimaryRChromaticityX: %lf", num);
+        videocontext->primaryR_chromaticityX = num;
+        break;
+      }
+      case GST_MATROSKA_ID_PRIMARYRCHROMATICITYY:{
+        gdouble num;
+
+        if ((ret = gst_ebml_read_float (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num < 0.0 || num > 1.0) {
+          GST_WARNING_OBJECT (demux, "Invalid PrimaryRChromaticityY %lf", num);
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "PrimaryRChromaticityY: %lf", num);
+        videocontext->primaryR_chromaticityY = num;
+        break;
+      }
+      case GST_MATROSKA_ID_PRIMARYGCHROMATICITYX:{
+        gdouble num;
+
+        if ((ret = gst_ebml_read_float (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num < 0.0 || num > 1.0) {
+          GST_WARNING_OBJECT (demux, "Invalid PrimaryGChromaticityX %lf", num);
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "PrimaryGChromaticityX: %lf", num);
+        videocontext->primaryG_chromaticityX = num;
+        break;
+      }
+      case GST_MATROSKA_ID_PRIMARYGCHROMATICITYY:{
+        gdouble num;
+
+        if ((ret = gst_ebml_read_float (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num < 0.0 || num > 1.0) {
+          GST_WARNING_OBJECT (demux, "Invalid PrimaryGChromaticityY %lf", num);
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "PrimaryGChromaticityY: %lf", num);
+        videocontext->primaryG_chromaticityY = num;
+        break;
+      }
+      case GST_MATROSKA_ID_PRIMARYBCHROMATICITYX:{
+        gdouble num;
+
+        if ((ret = gst_ebml_read_float (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num < 0.0 || num > 1.0) {
+          GST_WARNING_OBJECT (demux, "Invalid PrimaryBChromaticityX %lf", num);
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "PrimaryBChromaticityX: %lf", num);
+        videocontext->primaryB_chromaticityX = num;
+        break;
+      }
+      case GST_MATROSKA_ID_PRIMARYBCHROMATICITYY:{
+        gdouble num;
+
+        if ((ret = gst_ebml_read_float (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num < 0.0 || num > 1.0) {
+          GST_WARNING_OBJECT (demux, "Invalid PrimaryBChromaticityY %lf", num);
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "PrimaryBChromaticityY: %lf", num);
+        videocontext->primaryB_chromaticityY = num;
+        break;
+      }
+      case GST_MATROSKA_ID_WHITEPOINTCHROMATICITYX:{
+        gdouble num;
+
+        if ((ret = gst_ebml_read_float (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num < 0.0 || num > 1.0) {
+          GST_WARNING_OBJECT (demux,
+              "Invalid WhitePointChromaticityX %lf", num);
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "WhitePointChromaticityX: %lf", num);
+        videocontext->white_point_chromaticityX = num;
+        break;
+      }
+      case GST_MATROSKA_ID_WHITEPOINTCHROMATICITYY:{
+        gdouble num;
+
+        if ((ret = gst_ebml_read_float (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num < 0.0 || num > 1.0) {
+          GST_WARNING_OBJECT (demux,
+              "Invalid WhitePointChromaticityY %lf", num);
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "WhitePointChromaticityY: %lf", num);
+        videocontext->white_point_chromaticityY = num;
+        break;
+      }
+      case GST_MATROSKA_ID_LUMINANCEMAX:{
+        gdouble num;
+
+        if ((ret = gst_ebml_read_float (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num < 0.0 || num >= 10000.0) {
+          GST_WARNING_OBJECT (demux, "Invalid LuminanceMax %lf", num);
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "LuminanceMax: %lf", num);
+        videocontext->luminance_max = num;
+        break;
+      }
+      case GST_MATROSKA_ID_LUMINANCEMIN:{
+        gdouble num;
+
+        if ((ret = gst_ebml_read_float (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num < 0.0 || num >= 1000.0) {
+          GST_WARNING_OBJECT (demux, "Invalid LuminanceMin %lf", num);
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "LuminanceMin: %lf", num);
+        videocontext->luminance_min = num;
+        break;
+      }
+      default:
+        ret =
+            gst_matroska_read_common_parse_skip (&demux->common, ebml,
+            "MasteringMetaData", id);
+        break;
+    }
+  }
+
+  DEBUG_ELEMENT_STOP (demux, ebml, "MasteringMetaData", ret);
+
+  return ret;
+}
+
+static GstFlowReturn
+gst_matroska_demux_parse_videocolour (GstMatroskaDemux * demux,
+    GstEbmlRead * ebml, GstMatroskaTrackVideoContext * videocontext,
+    gint * valid_color)
+{
+  GstFlowReturn ret = GST_FLOW_OK;
+  guint32 id;
+
+  DEBUG_ELEMENT_START (demux, ebml, "VideoColour");
+
+  if ((ret = gst_ebml_read_master (ebml, &id)) != GST_FLOW_OK) {
+    DEBUG_ELEMENT_STOP (demux, ebml, "VideoColour", ret);
+    return ret;
+  }
+
+  while (ret == GST_FLOW_OK && gst_ebml_read_has_remaining (ebml, 1, TRUE)) {
+    if ((ret = gst_ebml_peek_id (ebml, &id)) != GST_FLOW_OK)
+      break;
+
+    switch (id) {
+      case GST_MATROSKA_ID_MATRIXCOEFFICIENTS:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num == 2) {
+          GST_WARNING_OBJECT (demux, "Invalid MatrixCoefficients 2");
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "MatrixCoefficients: %" G_GUINT64_FORMAT, num);
+        videocontext->matrix_coefficients = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_BITSPERCHANNEL:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num == 0) {
+          GST_WARNING_OBJECT (demux, "Invalid BitsPerChannel 0");
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "BitsPerChannel: %" G_GUINT64_FORMAT, num);
+        videocontext->bits_per_channel = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_CHROMASUBSAMPLINGHORZ:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        GST_DEBUG_OBJECT (demux,
+            "ChromaSubsamplingHorz: %" G_GUINT64_FORMAT, num);
+        videocontext->chroma_subsampling_horz = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_CHROMASUBSAMPLINGVERT:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        GST_DEBUG_OBJECT (demux,
+            "ChromaSubsamplingVert: %" G_GUINT64_FORMAT, num);
+        videocontext->chroma_subsampling_vert = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_CBSUBSAMPLINGHORZ:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        GST_DEBUG_OBJECT (demux, "CbSubsamplingHorz: %" G_GUINT64_FORMAT, num);
+        videocontext->cb_subsampling_horz = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_CBSUBSAMPLINGVERT:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        GST_DEBUG_OBJECT (demux, "CbSubsamplingVert: %" G_GUINT64_FORMAT, num);
+        videocontext->cb_subsampling_vert = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_CHROMASITINGHORZ:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        GST_DEBUG_OBJECT (demux, "ChromaSitingHorz: %" G_GUINT64_FORMAT, num);
+        videocontext->chroma_siting_horz = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_CHROMASITINGVERT:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        GST_DEBUG_OBJECT (demux, "ChromaSitingVert: %" G_GUINT64_FORMAT, num);
+        videocontext->chroma_siting_vert = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_RANGE:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num == 0) {
+          GST_WARNING_OBJECT (demux, "Invalid Range 0");
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "Range: %" G_GUINT64_FORMAT, num);
+        videocontext->range = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_TRANSFERCHARACTERISTICS:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num == 2) {
+          GST_WARNING_OBJECT (demux, "Invalid TransferCharacteristics 2");
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux,
+            "TransferCharacteristics: %" G_GUINT64_FORMAT, num);
+        videocontext->transfer_characteristics = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_PRIMARIES:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        if (num == 2) {
+          GST_WARNING_OBJECT (demux, "Invalid Primaries 2");
+          break;
+        }
+
+        GST_DEBUG_OBJECT (demux, "Primaries: %" G_GUINT64_FORMAT, num);
+        videocontext->primaries = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_MAXCLL:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        GST_DEBUG_OBJECT (demux, "MaxCLL: %" G_GUINT64_FORMAT, num);
+        videocontext->max_CLL = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_MAXFALL:{
+        guint64 num;
+
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          break;
+
+        GST_DEBUG_OBJECT (demux, "MaxFALL: %" G_GUINT64_FORMAT, num);
+        videocontext->max_FALL = num;
+        *valid_color = 1;
+        break;
+      }
+      case GST_MATROSKA_ID_MASTERINGMETADATA:{
+        ret =
+            gst_matroska_demux_parse_masteringmetadata (demux, ebml,
+            videocontext);
+        *valid_color = 1;
+        break;
+      }
+      default:
+        ret =
+            gst_matroska_read_common_parse_skip (&demux->common, ebml,
+            "VideoColour", id);
+        break;
+    }
+  }
+
+  DEBUG_ELEMENT_STOP (demux, ebml, "VideoColour", ret);
+
   return ret;
 }
 
@@ -585,6 +987,7 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
   guint32 id, riff_fourcc = 0;
   guint16 riff_audio_fmt = 0;
   gchar *codec = NULL;
+  gint valid_color = 0;
 
   DEBUG_ELEMENT_START (demux, ebml, "TrackEntry");
 
@@ -900,11 +1303,13 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
               break;
             }
 
+#if 0
               /* color info */
             case GST_MATROSKA_ID_VIDEOCOLOUR:{
               ret = gst_matroska_demux_parse_colour (demux, ebml, videocontext);
               break;
             }
+#endif
 
             case GST_MATROSKA_ID_VIDEOSTEREOMODE:
             {
@@ -956,7 +1361,14 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
               }
               break;
             }
-
+              /* HDR metadata */
+            case GST_MATROSKA_ID_VIDEOCOLOUR:{
+              ret =
+                  gst_matroska_demux_parse_videocolour (demux, ebml,
+                  videocontext, &valid_color);
+              videocontext->valid_color = valid_color;
+              break;
+            }
             default:
               GST_WARNING_OBJECT (demux,
                   "Unknown TrackVideo subelement 0x%x - ignoring", id);
@@ -971,6 +1383,11 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
               break;
           }
         }
+
+        /* For pushing I-frame only in FFx2 trick for UHD */
+        if ((videocontext->pixel_width / 16 * videocontext->pixel_height / 16) >
+            8704)
+          demux->is_higher_than_FHD = TRUE;
 
         DEBUG_ELEMENT_STOP (demux, ebml, "TrackVideo", ret);
         break;
@@ -1348,6 +1765,22 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
         gst_tag_list_add (context->tags, GST_TAG_MERGE_REPLACE,
             GST_TAG_VIDEO_CODEC, codec, NULL);
         context->tags_changed = TRUE;
+
+        if (riff_fourcc) {
+          gchar *format =
+              g_strdup_printf ("%c%c%c%c", GST_FOURCC_ARGS (riff_fourcc));
+          gst_caps_set_simple (caps, "format", G_TYPE_STRING, format, NULL);
+          g_free (format);
+        }
+
+        /* V_MS Video Codec is unseekable */
+        if (riff_fourcc == 0x44495658 && context->uid == 1836268893) {
+          gst_element_post_message (GST_ELEMENT_CAST (demux),
+              gst_message_new_application (GST_OBJECT_CAST (demux),
+                  gst_structure_new ("GstMessageSeekable", "SEEKABLE",
+                      G_TYPE_BOOLEAN, FALSE, NULL)));
+        }
+
         g_free (codec);
       }
       break;
@@ -1357,14 +1790,16 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
       GstMatroskaTrackAudioContext *audiocontext =
           (GstMatroskaTrackAudioContext *) context;
 
-      caps = gst_matroska_demux_audio_caps (audiocontext,
-          context->codec_id, context->codec_priv, context->codec_priv_size,
-          &codec, &riff_audio_fmt);
+      if (!demux->thumbnail_mode)
+        caps = gst_matroska_demux_audio_caps (audiocontext,
+            context->codec_id, context->codec_priv, context->codec_priv_size,
+            &codec, &riff_audio_fmt);
 
       if (codec) {
         gst_tag_list_add (context->tags, GST_TAG_MERGE_REPLACE,
             GST_TAG_AUDIO_CODEC, codec, NULL);
         context->tags_changed = TRUE;
+        demux->has_audio = TRUE;
         g_free (codec);
       }
       break;
@@ -1374,8 +1809,15 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
       GstMatroskaTrackSubtitleContext *subtitlecontext =
           (GstMatroskaTrackSubtitleContext *) context;
 
-      caps = gst_matroska_demux_subtitle_caps (subtitlecontext,
-          context->codec_id, context->codec_priv, context->codec_priv_size);
+      if (!demux->thumbnail_mode)
+        caps = gst_matroska_demux_subtitle_caps (subtitlecontext,
+            context->codec_id, context->codec_priv, context->codec_priv_size);
+
+      if (caps != NULL) {
+        gst_caps_set_simple (caps, "track-num", G_TYPE_INT,
+            demux->num_t_streams - 1, NULL);
+      }
+
       break;
     }
 
@@ -1402,6 +1844,11 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
     lang = gst_tag_get_language_code (context->language);
     gst_tag_list_add (context->tags, GST_TAG_MERGE_REPLACE,
         GST_TAG_LANGUAGE_CODE, (lang) ? lang : context->language, NULL);
+
+    if (context->name) {
+      gst_tag_list_add (context->tags, GST_TAG_MERGE_REPLACE,
+          GST_TAG_TITLE, context->name, NULL);
+    }
     context->tags_changed = TRUE;
   }
 
@@ -1459,6 +1906,7 @@ gst_matroska_demux_add_stream (GstMatroskaDemux * demux,
   GstEvent *stream_start;
 
   gchar *stream_id;
+  guint track_num = 0;
 
   g_ptr_array_add (demux->common.src, context);
   context->index = demux->common.num_streams++;
@@ -1471,22 +1919,30 @@ gst_matroska_demux_add_stream (GstMatroskaDemux * demux,
     case GST_MATROSKA_TRACK_TYPE_VIDEO:
       padname = g_strdup_printf ("video_%u", demux->num_v_streams++);
       templ = gst_element_class_get_pad_template (klass, "video_%u");
+      track_num = demux->num_v_streams;
       break;
 
     case GST_MATROSKA_TRACK_TYPE_AUDIO:
       padname = g_strdup_printf ("audio_%u", demux->num_a_streams++);
       templ = gst_element_class_get_pad_template (klass, "audio_%u");
+      track_num = demux->num_a_streams;
+      demux->audio_frame_push_ref |= 1 << context->index;
       break;
 
     case GST_MATROSKA_TRACK_TYPE_SUBTITLE:
       padname = g_strdup_printf ("subtitle_%u", demux->num_t_streams++);
       templ = gst_element_class_get_pad_template (klass, "subtitle_%u");
+      track_num = demux->num_t_streams;
       break;
 
     default:
       /* we should already have quit by now */
       g_assert_not_reached ();
   }
+  /* custom caps */
+  gst_caps_set_simple (context->caps, "seekable", G_TYPE_BOOLEAN,
+      demux->seekable, NULL);
+  gst_caps_set_simple (context->caps, "trickable", G_TYPE_BOOLEAN, TRUE, NULL);
 
   /* the pad in here */
   context->pad = gst_pad_new_from_template (templ, padname);
@@ -1506,8 +1962,8 @@ gst_matroska_demux_add_stream (GstMatroskaDemux * demux,
 
   stream_id =
       gst_pad_create_stream_id_printf (context->pad, GST_ELEMENT_CAST (demux),
-      "%03" G_GUINT64_FORMAT ":%03" G_GUINT64_FORMAT,
-      context->num, context->uid);
+      "%03" G_GUINT64_FORMAT ":%02d_%03" G_GUINT64_FORMAT,
+      context->num, track_num, context->uid);
   stream_start =
       gst_pad_get_sticky_event (demux->common.sinkpad, GST_EVENT_STREAM_START,
       0);
@@ -1523,6 +1979,63 @@ gst_matroska_demux_add_stream (GstMatroskaDemux * demux,
   }
 
   stream_start = gst_event_new_stream_start (stream_id);
+
+  if (context->type == GST_MATROSKA_TRACK_TYPE_VIDEO) {
+    GstMatroskaTrackVideoContext *videocontext =
+        (GstMatroskaTrackVideoContext *) context;
+    /* HDR metadata */
+    if (videocontext->valid_color) {
+      GstStructure *color_structure;
+
+      color_structure = gst_structure_new ("hdr-info",
+          "stream-id", G_TYPE_STRING, stream_id,
+          "transfer-characteristics", G_TYPE_UINT,
+          videocontext->transfer_characteristics, "color-primaries",
+          G_TYPE_UINT, videocontext->primaries, "matrix-coeffs",
+          G_TYPE_UINT, videocontext->matrix_coefficients,
+          "display-primaries-x0", G_TYPE_UINT,
+          (guint) (videocontext->primaryG_chromaticityX * 50000.0),
+          "display-primaries-x1", G_TYPE_UINT,
+          (guint) (videocontext->primaryB_chromaticityX * 50000.0),
+          "display-primaries-x2", G_TYPE_UINT,
+          (guint) (videocontext->primaryR_chromaticityX * 50000.0),
+          "display-primaries-y0", G_TYPE_UINT,
+          (guint) (videocontext->primaryG_chromaticityY * 50000.0),
+          "display-primaries-y1", G_TYPE_UINT,
+          (guint) (videocontext->primaryB_chromaticityY * 50000.0),
+          "display-primaries-y2", G_TYPE_UINT,
+          (guint) (videocontext->primaryR_chromaticityY * 50000.0),
+          "white-point-x", G_TYPE_UINT,
+          (guint) (videocontext->white_point_chromaticityX * 50000.0),
+          "white-point-y", G_TYPE_UINT,
+          (guint) (videocontext->white_point_chromaticityY * 50000.0),
+          "max-display-mastering-luminance", G_TYPE_UINT,
+          (guint) videocontext->luminance_max,
+          "min-display-mastering-luminance", G_TYPE_UINT,
+          (guint) videocontext->luminance_min, "video-full-range-flag",
+          G_TYPE_BOOLEAN, (videocontext->range == 2 ? TRUE : FALSE),
+          "max-content-light-level", G_TYPE_INT,
+          (gint) videocontext->max_CLL, "max-pic-average-light-level",
+          G_TYPE_INT, (gint) videocontext->max_FALL, NULL);
+
+      /* HACK: following mapping might not be correct
+       * from specification point of view. It's customized definition */
+      if (videocontext->transfer_characteristics == 16) {
+        gst_structure_set (color_structure,
+            "hdr-type", G_TYPE_STRING, "hdr10", NULL);
+      } else if (videocontext->transfer_characteristics == 18) {
+        gst_structure_set (color_structure,
+            "hdr-type", G_TYPE_STRING, "hlg", NULL);
+      }
+
+      GST_DEBUG_OBJECT (demux,
+          "Posting media-info about HDR: %" GST_PTR_FORMAT, color_structure);
+
+      gst_element_post_message (GST_ELEMENT_CAST (demux),
+          gst_message_new_element (GST_OBJECT_CAST (demux), color_structure));
+    }
+  }
+
   g_free (stream_id);
   if (demux->have_group_id)
     gst_event_set_group_id (stream_start, demux->group_id);
@@ -1531,6 +2044,9 @@ gst_matroska_demux_add_stream (GstMatroskaDemux * demux,
     stream_flags |= GST_STREAM_FLAG_SPARSE;
   if (context->flags & GST_MATROSKA_TRACK_DEFAULT)
     stream_flags |= GST_STREAM_FLAG_SELECT;
+  else if (!(context->flags & GST_MATROSKA_TRACK_ENABLED))
+    stream_flags |= GST_STREAM_FLAG_UNSELECT;
+
   gst_event_set_stream_flags (stream_start, stream_flags);
   gst_pad_push_event (context->pad, stream_start);
   gst_pad_set_caps (context->pad, context->caps);
@@ -1633,7 +2149,25 @@ gst_matroska_demux_query (GstMatroskaDemux * demux, GstPad * pad,
       }
       break;
     }
+    case GST_QUERY_CUSTOM:{
+      gboolean trickable = TRUE;
+      GstStructure *s;
 
+      s = (GstStructure *) gst_query_get_structure (query);
+
+      if (gst_structure_has_name (s, "custom-trickable")) {
+
+        if (demux->streaming && demux->is_higher_than_FHD)
+          trickable = FALSE;
+
+        gst_structure_set (s, "trickable", G_TYPE_BOOLEAN, trickable, NULL);
+        res = TRUE;
+        break;
+      } else {
+        res = gst_pad_query_default (pad, (GstObject *) demux, query);
+        break;
+      }
+    }
     case GST_QUERY_SEEKING:
     {
       GstFormat fmt;
@@ -2242,6 +2776,149 @@ exit:
   return entry;
 }
 
+/* scans for a cluster start from @pos in streaming mode,
+ * return GST_FLOW_OK and cluster position in @pos if found */
+static GstFlowReturn
+gst_matroska_demux_search_cluster_push (GstMatroskaDemux * demux, gint64 * pos)
+{
+  gint64 newpos;
+  gint cluster_pos;
+  gint64 orig_offset;
+  const guint8 *data = NULL;
+  gsize size;
+  guint64 length;
+  guint32 id;
+  guint needed;
+  GstFlowReturn ret = GST_FLOW_OK;
+  GstByteReader reader;
+  GstBuffer *buffer;
+
+
+  orig_offset = demux->common.offset;
+  newpos = demux->common.offset;
+  GST_LOG_OBJECT (demux, "searching cluster following offset %" G_GINT64_FORMAT,
+      orig_offset);
+  size = gst_adapter_available (demux->common.adapter);
+
+  if (demux->clusters) {
+    gint64 *cpos;
+
+    cpos = gst_util_array_binary_search (demux->clusters->data,
+        demux->clusters->len, sizeof (gint64),
+        (GCompareDataFunc) gst_matroska_cluster_compare,
+        GST_SEARCH_MODE_AFTER, pos, NULL);
+    /* sanity check */
+    if (cpos) {
+      GST_DEBUG_OBJECT (demux,
+          "cluster reported at offset %" G_GINT64_FORMAT, *cpos);
+      if (demux->common.offset + size - *cpos < 8) {
+        /* need more data */
+        ret = GST_FLOW_EOS;
+        goto exit;
+      }
+      demux->common.offset = *cpos;
+      ret = gst_matroska_read_common_peek_id_length_push (&demux->common,
+          GST_ELEMENT_CAST (demux), &id, &length, &needed);
+      if (ret == GST_FLOW_OK && id == GST_MATROSKA_ID_CLUSTER) {
+        newpos = *cpos;
+        goto exit;
+      }
+    }
+  }
+
+  /* read in at newpos and scan for ebml cluster id */
+  data = gst_adapter_map (demux->common.adapter, size);
+
+  gst_byte_reader_init (&reader, data, size);
+  cluster_pos = gst_byte_reader_masked_scan_uint32 (&reader, 0xffffffff,
+      GST_MATROSKA_ID_CLUSTER, 0, gst_byte_reader_get_remaining (&reader));
+
+  if (cluster_pos >= 0) {
+    int size_to_skip = 0;
+    newpos += cluster_pos;
+
+    GST_DEBUG_OBJECT (demux, "cluster pos %" G_GINT64_FORMAT, newpos);
+
+    /* prepare resuming at next byte */
+    if (!gst_byte_reader_skip (&reader, cluster_pos + 1)) {
+      GST_DEBUG_OBJECT (demux, "Need more data -> ");
+      /* need more data */
+      ret = GST_FLOW_EOS;
+      goto exit;
+    }
+    GST_DEBUG_OBJECT (demux,
+        "found cluster ebml id at offset %" G_GINT64_FORMAT, newpos);
+    /* extra checks whether we really sync'ed to a cluster:
+     * - either it is the first and only cluster
+     * - either there is a cluster after this one
+     * - either cluster length is undefined
+     */
+
+    /* ok if first cluster (there may not a subsequent one) */
+    if (newpos == demux->first_cluster_offset) {
+      GST_DEBUG_OBJECT (demux, "cluster is first cluster -> OK");
+      demux->common.offset = orig_offset;
+      /* need more data */
+      ret = GST_FLOW_OK;
+      goto exit;
+    }
+    /* Adusting the buffer position to next cluster found */
+    size_to_skip = newpos - demux->common.offset;
+    buffer = gst_adapter_take_buffer (demux->common.adapter, size_to_skip);
+    gst_buffer_unref (buffer);
+
+    GST_LOG_OBJECT (demux, "Buffer avail: %" G_GSIZE_FORMAT,
+        gst_adapter_available (demux->common.adapter));
+    ret = gst_matroska_read_common_peek_id_length_push (&demux->common,
+        GST_ELEMENT_CAST (demux), &id, &length, &needed);
+    if (ret != GST_FLOW_OK) {
+      GST_DEBUG_OBJECT (demux, "need more data -> ");
+      /* need more data */
+      ret = GST_FLOW_EOS;
+      goto exit;
+    }
+
+    GST_DEBUG_OBJECT (demux, "cluster size %" G_GUINT64_FORMAT ", prefix %d",
+        length, needed);
+    /* ok if undefined length or first cluster */
+    if (length == GST_EBML_SIZE_UNKNOWN || length == G_MAXUINT64
+        || id != GST_MATROSKA_ID_CLUSTER) {
+      GST_DEBUG_OBJECT (demux, "Invalid cluster ID or undefined length ");
+      ret = GST_FLOW_ERROR;
+      goto exit;
+    }
+
+    /* skip cluster */
+    demux->common.offset += length + needed;
+    ret = gst_matroska_read_common_peek_id_length_push (&demux->common,
+        GST_ELEMENT_CAST (demux), &id, &length, &needed);
+    if (ret != GST_FLOW_OK) {
+      ret = GST_FLOW_EOS;
+      goto exit;
+    }
+
+    GST_DEBUG_OBJECT (demux, "next element is %scluster",
+        id == GST_MATROSKA_ID_CLUSTER ? "" : "not ");
+
+    if (id == GST_MATROSKA_ID_CLUSTER)
+      ret = GST_FLOW_OK;
+
+  } else {
+    /* partial cluster id may have been in tail of buffer */
+    newpos += MAX (gst_byte_reader_get_remaining (&reader), 4) - 3;
+    GST_DEBUG_OBJECT (demux, "need more data -> ");
+    ret = GST_FLOW_EOS;
+  }
+
+exit:
+
+  if (data)
+    gst_adapter_unmap (demux->common.adapter);
+  demux->common.offset = orig_offset;
+  *pos = newpos;
+  return ret;
+}
+
 static gboolean
 gst_matroska_demux_handle_seek_event (GstMatroskaDemux * demux,
     GstPad * pad, GstEvent * event)
@@ -2262,6 +2939,9 @@ gst_matroska_demux_handle_seek_event (GstMatroskaDemux * demux,
   GstSearchMode snap_dir;
 
   g_return_val_if_fail (event != NULL, FALSE);
+
+  demux->skip_find_next_keyframe = FALSE;
+  demux->is_rate_changed = TRUE;
 
   if (pad)
     track = gst_pad_get_element_private (pad);
@@ -2425,6 +3105,11 @@ next:
   }
 
 finish:
+  if ((rate < 0.0) && keyunit) {
+    GST_INFO_OBJECT (demux, "Set the keyunit false for rewind trickplay");
+    keyunit = FALSE;
+  }
+
   if (keyunit && seeksegment.rate > 0) {
     GST_DEBUG_OBJECT (demux, "seek to key unit, adjusting segment start from %"
         GST_TIME_FORMAT " to %" GST_TIME_FORMAT,
@@ -2450,7 +3135,10 @@ finish:
     /* need to seek to cluster start to pick up cluster time */
     /* upstream takes care of flushing and all that
      * ... and newsegment event handling takes care of the rest */
-    return perform_seek_to_offset (demux, rate,
+    if (!gst_matroska_demux_move_to_entry (demux, entry, TRUE, update)) {
+      goto seek_error;
+    }
+    return perform_seek_to_offset (demux, (rate > 0.0) ? rate : 1.0,
         entry->pos + demux->common.ebml_segment_start, seqnum, flags);
   }
 
@@ -2461,6 +3149,10 @@ exit:
     GST_DEBUG_OBJECT (demux, "Stopping flush");
     gst_pad_push_event (demux->common.sinkpad, gst_event_ref (flush_event));
     gst_matroska_demux_send_event (demux, flush_event);
+    if (rate == 1.0) {
+      demux->skip_find_next_keyframe = TRUE;
+      GST_DEBUG_OBJECT (demux, "skip_find_next_keyframe flag is TRUE");
+    }
   }
 
   GST_OBJECT_LOCK (demux);
@@ -2487,9 +3179,14 @@ exit:
   if (demux->new_segment)
     gst_event_unref (demux->new_segment);
 
-  /* On port from 0.10, discarded !update (for segment.update) here, FIXME? */
-  demux->new_segment = gst_event_new_segment (&demux->common.segment);
-  gst_event_set_seqnum (demux->new_segment, seqnum);
+  if (demux->common.segment.rate == 1) {
+    demux->need_segment = TRUE;
+    demux->common.segment.position = 0;
+  } else {
+    /* On port from 0.10, discarded !update (for segment.update) here, FIXME? */
+    demux->new_segment = gst_event_new_segment (&demux->common.segment);
+    gst_event_set_seqnum (demux->new_segment, seqnum);
+  }
   if (demux->common.segment.rate < 0 && demux->common.segment.stop == -1)
     demux->to_time = demux->common.segment.position;
   else
@@ -2536,16 +3233,14 @@ gst_matroska_demux_handle_seek_push (GstMatroskaDemux * demux, GstPad * pad,
   gst_event_parse_seek (event, &rate, &format, &flags, &cur_type, &cur,
       &stop_type, &stop);
 
+  demux->is_rate_changed = TRUE;
+  demux->seek_rate = rate;
+
   /* sanity checks */
 
   /* we can only seek on time */
   if (format != GST_FORMAT_TIME) {
     GST_DEBUG_OBJECT (demux, "Can only seek on TIME");
-    return FALSE;
-  }
-
-  if (stop_type != GST_SEEK_TYPE_NONE && stop != GST_CLOCK_TIME_NONE) {
-    GST_DEBUG_OBJECT (demux, "Seek end-time not supported in streaming mode");
     return FALSE;
   }
 
@@ -2592,7 +3287,7 @@ gst_matroska_demux_handle_seek_push (GstMatroskaDemux * demux, GstPad * pad,
     if (!building_index) {
       /* seek to the first subindex or legacy index */
       GST_INFO_OBJECT (demux, "Seeking to Cues at %" G_GUINT64_FORMAT, offset);
-      return perform_seek_to_offset (demux, rate, offset,
+      return perform_seek_to_offset (demux, 1.0, offset,
           gst_event_get_seqnum (event), GST_SEEK_FLAG_NONE);
     }
 
@@ -2613,22 +3308,15 @@ gst_matroska_demux_handle_src_event (GstPad * pad, GstObject * parent,
 
   switch (GST_EVENT_TYPE (event)) {
     case GST_EVENT_SEEK:
-      /* no seeking until we are (safely) ready */
-      if (demux->common.state != GST_MATROSKA_READ_STATE_DATA) {
-        GST_DEBUG_OBJECT (demux, "not ready for seeking yet");
+    {
+      guint32 seqnum = gst_event_get_seqnum (event);
+      if (seqnum == demux->segment_seqnum) {
+        GST_LOG_OBJECT (pad,
+            "Drop duplicated SEEK event seqnum %" G_GUINT32_FORMAT, seqnum);
         gst_event_unref (event);
-        return FALSE;
+        return TRUE;
       }
-
-      {
-        guint32 seqnum = gst_event_get_seqnum (event);
-        if (seqnum == demux->segment_seqnum) {
-          GST_LOG_OBJECT (pad,
-              "Drop duplicated SEEK event seqnum %" G_GUINT32_FORMAT, seqnum);
-          gst_event_unref (event);
-          return TRUE;
-        }
-      }
+    }
 
       if (!demux->streaming)
         res = gst_matroska_demux_handle_seek_event (demux, pad, event);
@@ -2712,6 +3400,97 @@ gst_matroska_demux_handle_src_event (GstPad * pad, GstObject * parent,
   return res;
 }
 
+/* for highspeed trick-play, change the offset value to next keyframe position. */
+static gboolean
+gst_matroska_demux_move_to_next_keyframe_offset (GstMatroskaDemux * demux,
+    GstMatroskaIndex * entry, gboolean reset)
+{
+  gint i;
+  GST_OBJECT_LOCK (demux);
+
+  /* seek (relative to matroska segment) */
+  /* position might be invalid; will error when streaming resumes ... */
+  demux->common.offset = entry->pos + demux->common.ebml_segment_start;
+
+  GST_DEBUG_OBJECT (demux, "Seeked to offset %" G_GUINT64_FORMAT ", block %d, "
+      "time %" GST_TIME_FORMAT, entry->pos + demux->common.ebml_segment_start,
+      entry->block, GST_TIME_ARGS (entry->time));
+
+  GST_DEBUG_OBJECT (demux, "resetting stream state");
+
+  g_assert (demux->common.src->len == demux->common.num_streams);
+
+  for (i = 0; i < demux->common.src->len; i++) {
+    GstMatroskaTrackContext *context = g_ptr_array_index (demux->common.src, i);
+    context->pos = entry->time;
+    context->set_discont = TRUE;
+    context->eos = FALSE;
+    context->from_time = GST_CLOCK_TIME_NONE;
+
+    if (context->type == GST_MATROSKA_TRACK_TYPE_VIDEO) {
+      GstMatroskaTrackVideoContext *videocontext =
+          (GstMatroskaTrackVideoContext *) context;
+      /* demux object lock held by caller */
+      videocontext->earliest_time = GST_CLOCK_TIME_NONE;
+    }
+  }
+  demux->common.segment.position = entry->time;
+  demux->seek_block = entry->block;
+  demux->seek_first = TRUE;
+  demux->last_stop_end = GST_CLOCK_TIME_NONE;
+
+  GST_OBJECT_UNLOCK (demux);
+
+  return TRUE;
+
+}
+
+static GstFlowReturn
+gst_matroska_demux_seek_to_next_keyframe (GstMatroskaDemux * demux)
+{
+  GstFlowReturn ret = GST_FLOW_EOS;
+  GstMatroskaIndex *entry, *entry_prev;
+
+  if (!demux->seek_entry) {
+    GST_DEBUG_OBJECT (demux, "is the first entry?");
+  }
+
+  if (!demux->seek_index) {
+    GST_ERROR_OBJECT (demux, "there is no demux->seek_index");
+    return GST_FLOW_ERROR;
+  }
+
+  if ((demux->seek_entry + 1) >= demux->seek_index->len) {
+    GST_INFO_OBJECT (demux, "no more index entry");
+    goto exit;
+  }
+
+  entry_prev = &g_array_index (demux->seek_index, GstMatroskaIndex,
+      demux->seek_entry);
+
+  entry = &g_array_index (demux->seek_index, GstMatroskaIndex,
+      ++demux->seek_entry);
+
+  if (entry_prev->pos == entry->pos ||
+      demux->common.offset > entry->pos + demux->common.ebml_segment_start) {
+    GST_INFO_OBJECT (demux, "entry_prev->pos=[%" G_GUINT64_FORMAT "] "
+        "entry->pos=[%" G_GUINT64_FORMAT "] "
+        "demux->offset=[%" G_GUINT64_FORMAT "], "
+        "entry->pos + demux->ebml_segment_start=[%" G_GUINT64_FORMAT "]",
+        entry_prev->pos, entry->pos,
+        demux->common.offset, entry->pos + demux->common.ebml_segment_start);
+    return GST_FLOW_ERROR;
+  }
+
+  if (!gst_matroska_demux_move_to_next_keyframe_offset (demux, entry, FALSE))
+    goto exit;
+
+  return GST_FLOW_OK;
+
+exit:
+  return ret;
+}
+
 static GstFlowReturn
 gst_matroska_demux_seek_to_previous_keyframe (GstMatroskaDemux * demux)
 {
@@ -2766,6 +3545,45 @@ exit:
 }
 
 static GstFlowReturn
+gst_matroska_demux_parse_drm (GstMatroskaDemux * demux, GstEbmlRead * ebml)
+{
+  GstFlowReturn ret = GST_FLOW_OK;
+  guint64 version;
+  guint32 id;
+
+  DEBUG_ELEMENT_START (demux, ebml, "drm");
+
+  if ((ret = gst_ebml_read_master (ebml, &id)) != GST_FLOW_OK) {
+    DEBUG_ELEMENT_STOP (demux, ebml, "drm", ret);
+    return ret;
+  }
+
+  while (ret == GST_FLOW_OK && gst_ebml_read_has_remaining (ebml, 1, TRUE)) {
+    if ((ret = gst_ebml_peek_id (ebml, &id)) != GST_FLOW_OK) {
+      break;
+    }
+
+    switch (id) {
+      case GST_MATROSKA_ID_TRACKSDATAVERSION:
+        if ((ret = gst_ebml_read_uint (ebml, &id, &version)) != GST_FLOW_OK)
+          break;
+        GST_ERROR_OBJECT (demux, "drm version is %" G_GUINT64_FORMAT, version);
+        if (version > 0)
+          GST_ELEMENT_ERROR (demux, STREAM, DEMUX, (NULL),
+              ("DivX HD Plus DRM file"));
+        break;
+
+      default:
+        ret =
+            gst_matroska_read_common_parse_skip (&demux->common, ebml, "DRM",
+            id);
+        break;
+    }
+  }
+  return ret;
+}
+
+static GstFlowReturn
 gst_matroska_demux_parse_tracks (GstMatroskaDemux * demux, GstEbmlRead * ebml)
 {
   GstFlowReturn ret = GST_FLOW_OK;
@@ -2801,6 +3619,10 @@ gst_matroska_demux_parse_tracks (GstMatroskaDemux * demux, GstEbmlRead * ebml)
         }
         break;
       }
+
+      case GST_MATROSKA_ID_TRACKSDATA:
+        ret = gst_matroska_demux_parse_drm (demux, ebml);
+        break;
 
       default:
         ret = gst_matroska_read_common_parse_skip (&demux->common, ebml,
@@ -3039,6 +3861,28 @@ gst_matroska_demux_sync_streams (GstMatroskaDemux * demux)
       GST_OBJECT_UNLOCK (demux);
       gst_pad_push_event (context->pad, event);
       GST_OBJECT_LOCK (demux);
+    } else if (context->set_discont &&
+        !GST_CLOCK_TIME_IS_VALID (context->pos) &&
+        GST_CLOCK_TIME_IS_VALID (demux->common.segment.position) &&
+        demux->common.segment.position >
+        demux->common.segment.start + gap_threshold &&
+        demux->common.segment.position <
+        demux->common.segment.start + 2 * gap_threshold) {
+      /* Send gap event once after seek when nothing have been feeded yet
+         but lagging way behind others */
+      GstEvent *event;
+      gint64 start = demux->common.segment.start;
+      context->pos = demux->common.segment.position;
+
+      GST_DEBUG_OBJECT (demux,
+          "Synchronizing stream %d with other by advancing time from %"
+          GST_TIME_FORMAT " to %" GST_TIME_FORMAT, stream_nr,
+          GST_TIME_ARGS (start), GST_TIME_ARGS (context->pos));
+
+      event = gst_event_new_gap (start, context->pos - start);
+      GST_OBJECT_UNLOCK (demux);
+      gst_pad_push_event (context->pad, event);
+      GST_OBJECT_LOCK (demux);
     }
   }
 
@@ -3080,6 +3924,68 @@ gst_matroska_demux_push_stream_headers (GstMatroskaDemux * demux,
   ret = gst_flow_combiner_update_flow (demux->flowcombiner, ret);
 
   return ret;
+}
+
+static void
+gst_matroska_demux_make_vorbis_header (GstCaps * caps,
+    GstMatroskaTrackContext * stream)
+{
+  guint8 *p = (guint8 *) stream->codec_priv;
+  gint i, offset, num_packets;
+  guint *length, last;
+  guint total_len;
+  GstBuffer *buffer;
+  guint buf_offset;
+  GstMapInfo map;
+  gpointer data;
+
+  if (stream->codec_priv == NULL || stream->codec_priv_size == 0) {
+    return;
+  }
+
+  num_packets = p[0] + 1;
+
+  length = g_alloca (num_packets * sizeof (guint));
+  last = 0;
+  offset = 1;
+
+  /* first packets, read length values */
+  for (i = 0; i < num_packets - 1; i++) {
+    length[i] = 0;
+    while (offset < stream->codec_priv_size) {
+      length[i] += p[offset];
+      if (p[offset++] != 0xff)
+        break;
+    }
+    last += length[i];
+  }
+  if (offset + last > stream->codec_priv_size)
+    return;
+
+  /* last packet is the remaining size */
+  length[i] = stream->codec_priv_size - offset - last;
+
+  total_len = 0;
+  for (i = 0; i < num_packets; i++) {
+    total_len += length[i];
+  }
+
+  buffer = gst_buffer_new_allocate (NULL, total_len, NULL);
+  buf_offset = 0;
+  gst_buffer_map (buffer, &map, GST_MAP_WRITE);
+  data = map.data;
+
+  for (i = 0; i < num_packets; i++) {
+    if (offset + length[i] > stream->codec_priv_size)
+      return;
+    memcpy ((guint8 *) data + buf_offset, p + offset, length[i]);
+    buf_offset += length[i];
+    offset += length[i];
+  }
+
+  gst_caps_set_simple (caps, "codec_data", GST_TYPE_BUFFER, buffer, NULL);
+  gst_buffer_unmap (buffer, &map);
+  gst_buffer_unref (buffer);
 }
 
 static void
@@ -3894,6 +4800,17 @@ gst_matroska_demux_parse_blockgroup_or_simpleblock (GstMatroskaDemux * demux,
       guint64 clace_time;
       GstEvent *segment_event;
 
+      /* Trying to align the new segment to video key-frame start time,
+         rather than the cluster start time itself to avoid audio being
+         played without video */
+      if (demux->num_v_streams > 0 &&
+          ((stream->type != GST_MATROSKA_TRACK_TYPE_VIDEO) ||
+              (is_simpleblock && !(flags & 0x80)) || referenceblock)) {
+        GST_DEBUG_OBJECT (demux,
+            "Trying to align the new segment to video key-frame");
+        goto done;
+      }
+
       if (!GST_CLOCK_TIME_IS_VALID (demux->stream_start_time)) {
         demux->stream_start_time = lace_time;
         GST_DEBUG_OBJECT (demux,
@@ -3909,10 +4826,17 @@ gst_matroska_demux_parse_blockgroup_or_simpleblock (GstMatroskaDemux * demux,
         clace_time = demux->common.segment.position;
         segment->position = GST_CLOCK_TIME_NONE;
       }
-      segment->start = clace_time;
-      segment->stop = GST_CLOCK_TIME_NONE;
-      segment->time = segment->start - demux->stream_start_time;
-      segment->position = segment->start - demux->stream_start_time;
+      if (demux->seek_rate > 0.0) {
+        segment->start = clace_time;
+        segment->stop = GST_CLOCK_TIME_NONE;
+        segment->time = segment->start - demux->stream_start_time;
+        segment->position = segment->start - demux->stream_start_time;
+      } else {
+        segment->start = 0.0;
+        segment->stop = clace_time;
+        segment->rate = demux->seek_rate;
+      }
+
       GST_DEBUG_OBJECT (demux,
           "generated segment starting at %" GST_TIME_FORMAT ": %"
           GST_SEGMENT_FORMAT, GST_TIME_ARGS (lace_time), segment);
@@ -3953,17 +4877,49 @@ gst_matroska_demux_parse_blockgroup_or_simpleblock (GstMatroskaDemux * demux,
             (!strcmp (stream->codec_id, GST_MATROSKA_CODEC_ID_VIDEO_VP8) ||
             !strcmp (stream->codec_id, GST_MATROSKA_CODEC_ID_VIDEO_VP9) ||
             !strcmp (stream->codec_id, GST_MATROSKA_CODEC_ID_VIDEO_AV1));
+      } else {
+        if (demux->h264_codec == -1)
+          demux->h264_codec =
+              !strcmp (stream->codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MPEG4_AVC);
+
+        if (demux->h264_codec > 0) {
+          guint8 nal_unit_type =
+              map.data[gst_buffer_get_size (buf) - size + 4] & 0x1F;
+
+          if (nal_unit_type == 1)
+            delta_unit = TRUE;
+        }
       }
 
       /* If we're doing a keyframe-only trickmode, only push keyframes on video
        * streams */
       if (delta_unit
-          && demux->common.
-          segment.flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS) {
+          && demux->common.segment.
+          flags & GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS) {
         GST_LOG_OBJECT (demux, "Skipping non-keyframe on stream %d",
             stream->index);
         ret = GST_FLOW_OK;
         goto done;
+      }
+    }
+
+    if (is_simpleblock && demux->common.segment.rate == 1
+        && !strcmp (stream->codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MPEG4_AVC)
+        && stream->type == GST_MATROSKA_TRACK_TYPE_VIDEO && stream->set_discont
+        && delta_unit && demux->skip_find_next_keyframe)
+      goto done;
+
+    if ((demux->common.segment.rate < 0 || demux->common.segment.rate > 2)
+        || (demux->common.segment.rate == 2 && demux->is_higher_than_FHD)) {
+      if (stream->type == GST_MATROSKA_TRACK_TYPE_VIDEO) {
+        if (!delta_unit)
+          demux->keyframe_push_done = TRUE;
+        else
+          goto done;
+      } else if (stream->type == GST_MATROSKA_TRACK_TYPE_AUDIO) {
+        demux->audio_frame_push_check |= 1 << stream->index;
+        if (demux->audio_frame_push_ref == demux->audio_frame_push_check)
+          demux->audio_frame_push_done = TRUE;
       }
     }
 
@@ -4039,6 +4995,7 @@ gst_matroska_demux_parse_blockgroup_or_simpleblock (GstMatroskaDemux * demux,
         GST_BUFFER_PTS (sub) = lace_time;
       } else {
         GST_BUFFER_DTS (sub) = lace_time;
+        GST_BUFFER_TIMESTAMP (sub) = lace_time;
         if (stream->intra_only)
           GST_BUFFER_PTS (sub) = lace_time;
       }
@@ -5106,7 +6063,7 @@ gst_matroska_demux_loop (GstPad * pad)
   ret = gst_matroska_demux_parse_id (demux, id, length, needed);
   if (ret == GST_FLOW_EOS)
     goto eos;
-  if (ret != GST_FLOW_OK)
+  if (ret != GST_FLOW_OK && ret < GST_FLOW_CUSTOM_SUCCESS)
     goto pause;
 
   /* check if we're at the end of a configured segment */
@@ -5139,6 +6096,25 @@ next:
     }
   }
 
+  /* add to check skip_find_next_keyframe to resolve mismatching pts
+     when we return play from trickmode. */
+  if (!demux->skip_find_next_keyframe && demux->keyframe_push_done
+      && (!demux->has_audio || demux->audio_frame_push_done)) {
+    demux->keyframe_push_done = FALSE;
+    demux->audio_frame_push_done = FALSE;
+    demux->audio_frame_push_check = 0;
+
+    if (demux->common.segment.rate > 0.0) {
+      ret = gst_matroska_demux_seek_to_next_keyframe (demux);
+      if (ret == GST_FLOW_EOS)
+        goto eos;
+    } else {
+      ret = gst_matroska_demux_seek_to_previous_keyframe (demux);
+      if (ret == GST_FLOW_EOS)
+        goto pause;
+    }
+  }
+
   return;
 
   /* ERRORS */
@@ -5146,8 +6122,10 @@ eos:
   {
     if (demux->common.segment.rate < 0.0) {
       ret = gst_matroska_demux_seek_to_previous_keyframe (demux);
-      if (ret == GST_FLOW_OK)
-        return;
+      if (ret == GST_FLOW_EOS)
+        goto pause;
+
+      return;
     }
     /* fall-through */
   }
@@ -5247,6 +6225,30 @@ perform_seek_to_offset (GstMatroskaDemux * demux, gdouble rate, guint64 offset,
   return res;
 }
 
+static gboolean
+perform_seek_to_keyframe_offset (GstMatroskaDemux * demux,
+    gdouble rate, guint64 offset)
+{
+  GstEvent *event;
+  gboolean res = 0;
+
+  if (demux->is_flushing) {
+    GST_WARNING_OBJECT (demux, "In flushing so we skip this step.");
+    return res;
+  }
+
+  GST_DEBUG_OBJECT (demux, "seeking to kf offset:%" G_GUINT64_FORMAT, offset);
+  demux->is_rate_changed = FALSE;
+  event =
+      gst_event_new_seek (rate, GST_FORMAT_BYTES,
+      GST_SEEK_FLAG_FLUSH, GST_SEEK_TYPE_SET, offset, GST_SEEK_TYPE_NONE, -1);
+  res = gst_pad_push_event (demux->common.sinkpad, event);
+
+  /* segment event will update offset */
+  return res;
+
+}
+
 static GstFlowReturn
 gst_matroska_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
 {
@@ -5254,8 +6256,8 @@ gst_matroska_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
   guint available;
   GstFlowReturn ret = GST_FLOW_OK;
   guint needed = 0;
-  guint32 id;
-  guint64 length;
+  guint32 id = 0;
+  guint64 length = 0;
 
   if (G_UNLIKELY (GST_BUFFER_IS_DISCONT (buffer))) {
     GST_DEBUG_OBJECT (demux, "got DISCONT");
@@ -5272,6 +6274,29 @@ gst_matroska_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
 next:
   available = gst_adapter_available (demux->common.adapter);
 
+  if (demux->scan_next_cluster_push) {
+    gint64 pos;
+
+    GST_LOG_OBJECT (demux, "cluster scanning ...");
+    ret = gst_matroska_demux_search_cluster_push (demux, &pos);
+    if (ret == GST_FLOW_EOS) {
+      GST_LOG_OBJECT (demux, "Need more data..");
+      /* need more data */
+      return GST_FLOW_OK;
+    } else if (ret != GST_FLOW_OK) {
+      /* clear this flag for scanning the next valid cluster */
+      /* no valid clusters found */
+      demux->scan_next_cluster_push = FALSE;
+      return ret;
+    }
+    GST_DEBUG_OBJECT (demux, "cluster found at %" G_GUINT64_FORMAT, pos);
+    /* clear this flag for scanning the next valid cluster */
+    /* valid clusters found */
+    demux->scan_next_cluster_push = FALSE;
+    /* try that position */
+    demux->common.offset = pos;
+  }
+
   ret = gst_matroska_read_common_peek_id_length_push (&demux->common,
       GST_ELEMENT_CAST (demux), &id, &length, &needed);
   if (G_UNLIKELY (ret != GST_FLOW_OK && ret != GST_FLOW_EOS)) {
@@ -5279,6 +6304,20 @@ next:
         && demux->common.offset >=
         demux->common.ebml_segment_start + demux->common.ebml_segment_length) {
       return GST_FLOW_OK;
+    } else if (!demux->scan_next_cluster_push) {
+      /* check parse error */
+      if (!IS_HIGH_SPEED_TRICK (demux)) {
+        /* set this flag for scanning the next valid cluster */
+        demux->scan_next_cluster_push = TRUE;
+        goto next;
+      } else {
+        /* clear the following flags so that seek to next kf will happen */
+        demux->keyframe_push_done = TRUE;
+        demux->audio_frame_push_done = TRUE;
+        demux->audio_frame_push_check = demux->audio_frame_push_ref;
+        /* flush the currently available data */
+        length = available;
+      }
     } else {
       gint64 bytes_scanned;
       if (demux->common.start_resync_offset == -1) {
@@ -5310,10 +6349,36 @@ next:
     return GST_FLOW_OK;
 
   ret = gst_matroska_demux_parse_id (demux, id, length, needed);
+
+  if (!demux->skip_find_next_keyframe && demux->keyframe_push_done
+      && (!demux->has_audio || demux->audio_frame_push_done)) {
+
+    GST_LOG_OBJECT (demux, "### Keyframe_push_done");
+    demux->keyframe_push_done = FALSE;
+    demux->audio_frame_push_done = FALSE;
+    demux->audio_frame_push_check = 0;
+
+    if (demux->seek_rate < 0.0) {
+      ret = gst_matroska_demux_seek_to_previous_keyframe (demux);
+      if (ret == GST_FLOW_OK) {
+        perform_seek_to_keyframe_offset (demux, 1.0, demux->common.offset);
+      } else if (ret == GST_FLOW_EOS) {
+        gst_matroska_demux_send_event (demux, gst_event_new_eos ());
+      }
+    } else {
+      /*In case of FWD highspeed trick-play */
+      if (gst_matroska_demux_seek_to_next_keyframe (demux) == GST_FLOW_OK) {
+        /* seek to next key-frame when valid index is returned */
+        perform_seek_to_keyframe_offset (demux, demux->common.segment.rate,
+            demux->common.offset);
+      }
+    }
+  }
+
   if (ret == GST_FLOW_EOS) {
     /* need more data */
     return GST_FLOW_OK;
-  } else if (ret != GST_FLOW_OK) {
+  } else if (ret != GST_FLOW_OK && ret < GST_FLOW_CUSTOM_SUCCESS) {
     return ret;
   } else
     goto next;
@@ -5333,6 +6398,9 @@ gst_matroska_demux_handle_sink_event (GstPad * pad, GstObject * parent,
     case GST_EVENT_SEGMENT:
     {
       const GstSegment *segment;
+
+      if (!demux->is_rate_changed)
+        goto exit;
 
       /* some debug output */
       gst_event_parse_segment (event, &segment);
@@ -5371,8 +6439,11 @@ gst_matroska_demux_handle_sink_event (GstPad * pad, GstObject * parent,
       demux->need_segment = TRUE;
       demux->segment_seqnum = gst_event_get_seqnum (event);
       /* but keep some of the upstream segment */
-      demux->common.segment.rate = segment->rate;
       demux->common.segment.flags = segment->flags;
+      if (demux->seek_rate > 0.0)
+        demux->common.segment.rate = segment->rate;
+      else
+        demux->common.segment.rate = demux->seek_rate;
       /* also check if need to keep some of the requested seek position */
       if (demux->seek_offset == segment->start) {
         GST_DEBUG_OBJECT (demux, "position matches requested seek");
@@ -5406,6 +6477,16 @@ gst_matroska_demux_handle_sink_event (GstPad * pad, GstObject * parent,
       }
       break;
     }
+    case GST_EVENT_FLUSH_START:
+    {
+      if (!demux->is_rate_changed) {
+        gst_event_unref (event);
+        return res;
+      }
+      demux->is_flushing = TRUE;
+      res = gst_pad_event_default (pad, parent, event);
+      break;
+    }
     case GST_EVENT_FLUSH_STOP:
     {
       guint64 dur;
@@ -5415,12 +6496,21 @@ gst_matroska_demux_handle_sink_event (GstPad * pad, GstObject * parent,
       gst_matroska_read_common_reset_streams (&demux->common,
           GST_CLOCK_TIME_NONE, TRUE);
       gst_flow_combiner_reset (demux->flowcombiner);
-      dur = demux->common.segment.duration;
-      gst_segment_init (&demux->common.segment, GST_FORMAT_TIME);
-      demux->common.segment.duration = dur;
       demux->cluster_time = GST_CLOCK_TIME_NONE;
       demux->cluster_offset = 0;
+      dur = demux->common.segment.duration;
+      if (!demux->is_rate_changed) {
+        gst_event_unref (event);
+        GST_OBJECT_UNLOCK (demux);
+        return res;
+      }
+      gst_segment_init (&demux->common.segment, GST_FORMAT_TIME);
+      demux->common.segment.duration = dur;
+      demux->keyframe_push_done = FALSE;
+      demux->audio_frame_push_done = FALSE;
+      demux->audio_frame_push_check = 0;
       GST_OBJECT_UNLOCK (demux);
+      demux->is_flushing = FALSE;
       /* fall-through */
     }
     default:
@@ -5541,8 +6631,30 @@ gst_matroska_demux_video_caps (GstMatroskaTrackVideoContext *
                 size - offset), size - offset);
       }
 
-      if (riff_fourcc)
+      if (riff_fourcc) {
         *riff_fourcc = vids->compression;
+
+        switch (videocontext->fourcc) {
+          case GST_MAKE_FOURCC ('D', 'X', '5', '0'):
+          case GST_MAKE_FOURCC ('d', 'i', 'v', 'x'):
+          case GST_MAKE_FOURCC ('D', 'I', 'V', 'X'):
+          case GST_MAKE_FOURCC ('D', 'I', 'V', '3'):
+          case GST_MAKE_FOURCC ('d', 'i', 'v', '3'):
+          case GST_MAKE_FOURCC ('D', 'V', 'X', '3'):
+          case GST_MAKE_FOURCC ('d', 'v', 'x', '3'):
+          case GST_MAKE_FOURCC ('D', 'I', 'V', '4'):
+          case GST_MAKE_FOURCC ('d', 'i', 'v', '4'):
+          case GST_MAKE_FOURCC ('D', 'I', 'V', '5'):
+          case GST_MAKE_FOURCC ('d', 'i', 'v', '5'):
+          case GST_MAKE_FOURCC ('D', 'I', 'V', '6'):
+          case GST_MAKE_FOURCC ('d', 'i', 'v', '6'):
+            *riff_fourcc = GST_MAKE_FOURCC ('X', 'V', 'I', 'D');
+            break;
+
+          default:
+            break;
+        }
+      }
 
       caps = gst_riff_create_video_caps (vids->compression, NULL, vids,
           buf, NULL, codec_name);
@@ -5554,8 +6666,14 @@ gst_matroska_demux_video_caps (GstMatroskaTrackVideoContext *
         static GstStaticCaps intra_caps = GST_STATIC_CAPS ("image/jpeg; "
             "video/x-raw; image/png; video/x-dv; video/x-huffyuv; video/x-ffv; "
             "video/x-compressed-yuv");
+        GstStructure *s;
         context->intra_only =
             gst_caps_can_intersect (gst_static_caps_get (&intra_caps), caps);
+
+        s = gst_caps_get_structure (caps, 0);
+        if (gst_structure_has_name (s, "video/x-h264"))
+          gst_structure_set (s, "stream-format", G_TYPE_STRING, "byte-stream",
+              "alignment", G_TYPE_STRING, "au", NULL);
       }
 
       if (buf)
@@ -5608,12 +6726,9 @@ gst_matroska_demux_video_caps (GstMatroskaTrackVideoContext *
     caps = gst_video_info_to_caps (&info);
     *codec_name = gst_pb_utils_get_codec_description (caps);
     context->alignment = 32;
-  } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MPEG4_SP)) {
-    caps = gst_caps_new_simple ("video/x-divx",
-        "divxversion", G_TYPE_INT, 4, NULL);
-    *codec_name = g_strdup ("MPEG-4 simple profile");
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MPEG4_ASP) ||
-      !strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MPEG4_AP)) {
+      !strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MPEG4_AP) ||
+      !strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MPEG4_SP)) {
     caps = gst_caps_new_simple ("video/mpeg",
         "mpegversion", G_TYPE_INT, 4,
         "systemstream", G_TYPE_BOOLEAN, FALSE, NULL);
@@ -5630,15 +6745,10 @@ gst_matroska_demux_video_caps (GstMatroskaTrackVideoContext *
       *codec_name = g_strdup ("MPEG-4 advanced simple profile");
     else
       *codec_name = g_strdup ("MPEG-4 advanced profile");
+    gst_caps_set_simple (caps, "format", G_TYPE_STRING, "MP4V", NULL);
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MSMPEG4V3)) {
-#if 0
-    caps = gst_caps_new_full (gst_structure_new ("video/x-divx",
-            "divxversion", G_TYPE_INT, 3, NULL),
-        gst_structure_new ("video/x-msmpeg",
-            "msmpegversion", G_TYPE_INT, 43, NULL), NULL);
-#endif
     caps = gst_caps_new_simple ("video/x-msmpeg",
-        "msmpegversion", G_TYPE_INT, 43, NULL);
+        "msmpegversion", G_TYPE_INT, 43, "format", G_TYPE_STRING, "MP43", NULL);
     *codec_name = g_strdup ("Microsoft MPEG-4 v.3");
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MPEG1) ||
       !strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MPEG2)) {
@@ -5652,10 +6762,15 @@ gst_matroska_demux_video_caps (GstMatroskaTrackVideoContext *
     caps = gst_caps_new_simple ("video/mpeg",
         "systemstream", G_TYPE_BOOLEAN, FALSE,
         "mpegversion", G_TYPE_INT, mpegversion, NULL);
+
+    gst_caps_set_simple (caps, "format", G_TYPE_STRING,
+        (mpegversion == 2) ? "MP2V" : "MP1V", NULL);
+
     *codec_name = g_strdup_printf ("MPEG-%d video", mpegversion);
     context->postprocess_frame = gst_matroska_demux_add_mpeg_seq_header;
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MJPEG)) {
-    caps = gst_caps_new_empty_simple ("image/jpeg");
+    caps = gst_caps_new_simple ("image/jpeg",
+        "format", G_TYPE_STRING, "MJPG", NULL);
     *codec_name = g_strdup ("Motion-JPEG");
     context->intra_only = TRUE;
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_MPEG4_AVC)) {
@@ -5674,7 +6789,8 @@ gst_matroska_demux_video_caps (GstMatroskaTrackVideoContext *
       gst_buffer_unref (priv);
 
       gst_caps_set_simple (caps, "stream-format", G_TYPE_STRING, "avc",
-          "alignment", G_TYPE_STRING, "au", NULL);
+          "alignment", G_TYPE_STRING, "au",
+          "format", G_TYPE_STRING, "H264", NULL);
     } else {
       GST_WARNING ("No codec data found, assuming output is byte-stream");
       gst_caps_set_simple (caps, "stream-format", G_TYPE_STRING, "byte-stream",
@@ -5694,49 +6810,14 @@ gst_matroska_demux_video_caps (GstMatroskaTrackVideoContext *
       gst_buffer_unref (priv);
 
       gst_caps_set_simple (caps, "stream-format", G_TYPE_STRING, "hvc1",
-          "alignment", G_TYPE_STRING, "au", NULL);
+          "alignment", G_TYPE_STRING, "au", "format", G_TYPE_STRING, "HEVC",
+          NULL);
     } else {
       GST_WARNING ("No codec data found, assuming output is byte-stream");
       gst_caps_set_simple (caps, "stream-format", G_TYPE_STRING, "byte-stream",
           NULL);
     }
     *codec_name = g_strdup ("HEVC");
-  } else if ((!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO1)) ||
-      (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO2)) ||
-      (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO3)) ||
-      (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO4))) {
-    gint rmversion = -1;
-
-    if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO1))
-      rmversion = 1;
-    else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO2))
-      rmversion = 2;
-    else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO3))
-      rmversion = 3;
-    else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO4))
-      rmversion = 4;
-
-    caps = gst_caps_new_simple ("video/x-pn-realvideo",
-        "rmversion", G_TYPE_INT, rmversion, NULL);
-    GST_DEBUG ("data:%p, size:0x%x", data, size);
-    /* We need to extract the extradata ! */
-    if (data && (size >= 0x22)) {
-      GstBuffer *priv;
-      guint rformat;
-      guint subformat;
-
-      subformat = GST_READ_UINT32_BE (data + 0x1a);
-      rformat = GST_READ_UINT32_BE (data + 0x1e);
-
-      priv =
-          gst_buffer_new_wrapped (g_memdup (data + 0x1a, size - 0x1a),
-          size - 0x1a);
-      gst_caps_set_simple (caps, "codec_data", GST_TYPE_BUFFER, priv, "format",
-          G_TYPE_INT, rformat, "subformat", G_TYPE_INT, subformat, NULL);
-      gst_buffer_unref (priv);
-
-    }
-    *codec_name = g_strdup_printf ("RealVideo %d.0", rmversion);
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_THEORA)) {
     caps = gst_caps_new_empty_simple ("video/x-theora");
     context->stream_headers =
@@ -5748,13 +6829,25 @@ gst_matroska_demux_video_caps (GstMatroskaTrackVideoContext *
     caps = gst_caps_new_empty_simple ("video/x-dirac");
     *codec_name = g_strdup_printf ("Dirac");
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_VP8)) {
-    caps = gst_caps_new_empty_simple ("video/x-vp8");
+    caps = gst_caps_new_simple ("video/x-vp8",
+        "format", G_TYPE_STRING, "VP80", NULL);
     *codec_name = g_strdup_printf ("On2 VP8");
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_VP9)) {
-    caps = gst_caps_new_empty_simple ("video/x-vp9");
+    caps = gst_caps_new_simple ("video/x-vp9",
+        "format", G_TYPE_STRING, "VP90", NULL);
     *codec_name = g_strdup_printf ("On2 VP9");
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_AV1)) {
-    caps = gst_caps_new_empty_simple ("video/x-av1");
+    caps = gst_caps_new_simple ("video/x-av1",
+        "format", G_TYPE_STRING, "AV01", NULL);
+    if (data) {
+      GstBuffer *priv;
+
+      priv = gst_buffer_new_wrapped (g_memdup (data, size), size);
+      gst_caps_set_simple (caps, "codec_data", GST_TYPE_BUFFER, priv, NULL);
+      gst_buffer_unref (priv);
+    } else {
+      GST_WARNING ("No AV1 codec data found!");
+    }
     *codec_name = g_strdup_printf ("AOM AV1");
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_VIDEO_PRORES)) {
     guint32 fourcc;
@@ -5806,6 +6899,9 @@ gst_matroska_demux_video_caps (GstMatroskaTrackVideoContext *
   if (caps != NULL) {
     int i;
     GstStructure *structure;
+
+    gst_caps_set_simple (caps, "container", G_TYPE_STRING, "mkv",
+        "timestamptype", G_TYPE_BOOLEAN, TRUE, NULL);
 
     for (i = 0; i < gst_caps_get_size (caps); i++) {
       structure = gst_caps_get_structure (caps, i);
@@ -5900,6 +6996,12 @@ gst_matroska_demux_video_caps (GstMatroskaTrackVideoContext *
     }
 
     caps = gst_caps_simplify (caps);
+  }
+
+  if (!g_strcmp0 (*codec_name, "ITU H.26n")
+      && (riff_fourcc && *riff_fourcc == GST_MAKE_FOURCC ('H', '2', '6', '3'))) {
+    g_free (*codec_name);
+    *codec_name = g_strdup_printf ("H.263");
   }
 
   return caps;
@@ -6069,9 +7171,6 @@ gst_matroska_demux_audio_caps (GstMatroskaTrackAudioContext *
           strlen (GST_MATROSKA_CODEC_ID_AUDIO_TRUEHD))) {
     caps = gst_caps_new_empty_simple ("audio/x-true-hd");
     *codec_name = g_strdup ("Dolby TrueHD");
-  } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_DTS)) {
-    caps = gst_caps_new_empty_simple ("audio/x-dts");
-    *codec_name = g_strdup ("DTS audio");
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_VORBIS)) {
     caps = gst_caps_new_empty_simple ("audio/x-vorbis");
     context->stream_headers =
@@ -6079,6 +7178,7 @@ gst_matroska_demux_audio_caps (GstMatroskaTrackAudioContext *
         context->codec_priv_size);
     /* FIXME: mark stream as broken and skip if there are no stream headers */
     context->send_stream_headers = TRUE;
+    *codec_name = g_strdup ("VORBIS audio");
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_FLAC)) {
     caps = gst_caps_new_empty_simple ("audio/x-flac");
     context->stream_headers =
@@ -6150,6 +7250,7 @@ gst_matroska_demux_audio_caps (GstMatroskaTrackAudioContext *
 
     if (data && size >= 18) {
       GstBuffer *codec_data = NULL;
+      guint16 word_size = 0;
 
       /* little-endian -> byte-order */
       auds.format = GST_READ_UINT16_LE (data);
@@ -6158,6 +7259,11 @@ gst_matroska_demux_audio_caps (GstMatroskaTrackAudioContext *
       auds.av_bps = GST_READ_UINT32_LE (data + 8);
       auds.blockalign = GST_READ_UINT16_LE (data + 12);
       auds.bits_per_sample = GST_READ_UINT16_LE (data + 16);
+      word_size = GST_READ_UINT16_LE (data + 14);
+
+      /* do not support wma version 1 */
+      if (auds.format == 352)
+        return NULL;
 
       /* 18 is the waveformatex size */
       if (size > 18) {
@@ -6176,6 +7282,8 @@ gst_matroska_demux_audio_caps (GstMatroskaTrackAudioContext *
 
       if (caps == NULL) {
         GST_WARNING ("Unhandled RIFF audio format 0x%02x", auds.format);
+      } else {
+        gst_caps_set_simple (caps, "word_size", G_TYPE_INT, word_size, NULL);
       }
     } else {
       GST_WARNING ("Invalid codec data size (%d expected, got %d)", 18, size);
@@ -6282,67 +7390,6 @@ gst_matroska_demux_audio_caps (GstMatroskaTrackAudioContext *
     *codec_name = g_strdup ("Wavpack audio");
     context->postprocess_frame = gst_matroska_demux_add_wvpk_header;
     audiocontext->wvpk_block_index = 0;
-  } else if ((!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_REAL_14_4)) ||
-      (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_REAL_28_8)) ||
-      (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_REAL_COOK))) {
-    gint raversion = -1;
-
-    if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_REAL_14_4))
-      raversion = 1;
-    else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_REAL_COOK))
-      raversion = 8;
-    else
-      raversion = 2;
-
-    caps = gst_caps_new_simple ("audio/x-pn-realaudio",
-        "raversion", G_TYPE_INT, raversion, NULL);
-    /* Extract extra information from caps, mapping varies based on codec */
-    if (data && (size >= 0x50)) {
-      GstBuffer *priv;
-      guint flavor;
-      guint packet_size;
-      guint height;
-      guint leaf_size;
-      guint sample_width;
-      guint extra_data_size;
-
-      GST_DEBUG ("real audio raversion:%d", raversion);
-      if (raversion == 8) {
-        /* COOK */
-        flavor = GST_READ_UINT16_BE (data + 22);
-        packet_size = GST_READ_UINT32_BE (data + 24);
-        height = GST_READ_UINT16_BE (data + 40);
-        leaf_size = GST_READ_UINT16_BE (data + 44);
-        sample_width = GST_READ_UINT16_BE (data + 58);
-        extra_data_size = GST_READ_UINT32_BE (data + 74);
-
-        GST_DEBUG
-            ("flavor:%d, packet_size:%d, height:%d, leaf_size:%d, sample_width:%d, extra_data_size:%d",
-            flavor, packet_size, height, leaf_size, sample_width,
-            extra_data_size);
-        gst_caps_set_simple (caps, "flavor", G_TYPE_INT, flavor, "packet_size",
-            G_TYPE_INT, packet_size, "height", G_TYPE_INT, height, "leaf_size",
-            G_TYPE_INT, leaf_size, "width", G_TYPE_INT, sample_width, NULL);
-
-        if ((size - 78) >= extra_data_size) {
-          priv = gst_buffer_new_wrapped (g_memdup (data + 78, extra_data_size),
-              extra_data_size);
-          gst_caps_set_simple (caps, "codec_data", GST_TYPE_BUFFER, priv, NULL);
-          gst_buffer_unref (priv);
-        }
-      }
-    }
-
-    *codec_name = g_strdup_printf ("RealAudio %d.0", raversion);
-  } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_REAL_SIPR)) {
-    caps = gst_caps_new_empty_simple ("audio/x-sipro");
-    *codec_name = g_strdup ("Sipro/ACELP.NET Voice Codec");
-  } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_REAL_RALF)) {
-    caps = gst_caps_new_empty_simple ("audio/x-ralf-mpeg4-generic");
-    *codec_name = g_strdup ("Real Audio Lossless");
-  } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_REAL_ATRC)) {
-    caps = gst_caps_new_empty_simple ("audio/x-vnd.sony.atrac3");
-    *codec_name = g_strdup ("Sony ATRAC3");
   } else {
     GST_WARNING ("Unknown codec '%s', cannot build Caps", codec_id);
     return NULL;
@@ -6357,6 +7404,11 @@ gst_matroska_demux_audio_caps (GstMatroskaTrackAudioContext *
             "channels", G_TYPE_INT, audiocontext->channels,
             "rate", G_TYPE_INT, audiocontext->samplerate, NULL);
       }
+    }
+    if (context->send_stream_headers == TRUE &&
+        !strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_VORBIS)) {
+      gst_matroska_demux_make_vorbis_header (caps, context);
+      context->send_stream_headers = FALSE;
     }
 
     caps = gst_caps_simplify (caps);
@@ -6399,6 +7451,7 @@ gst_matroska_demux_subtitle_caps (GstMatroskaTrackSubtitleContext *
     caps = gst_caps_new_empty_simple ("application/x-ass");
     context->postprocess_frame = gst_matroska_demux_check_subtitle_buffer;
     subtitlecontext->check_markup = FALSE;
+#if 0
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_SUBTITLE_USF)) {
     caps = gst_caps_new_empty_simple ("application/x-usf");
     context->postprocess_frame = gst_matroska_demux_check_subtitle_buffer;
@@ -6415,6 +7468,7 @@ gst_matroska_demux_subtitle_caps (GstMatroskaTrackSubtitleContext *
         context->codec_priv_size);
     /* FIXME: mark stream as broken and skip if there are no stream headers */
     context->send_stream_headers = TRUE;
+#endif
   } else {
     GST_DEBUG ("Unknown subtitle stream: codec_id='%s'", codec_id);
     caps = gst_caps_new_empty_simple ("application/x-subtitle-unknown");
@@ -6469,9 +7523,24 @@ gst_matroska_demux_change_state (GstElement * element,
 {
   GstMatroskaDemux *demux = GST_MATROSKA_DEMUX (element);
   GstStateChangeReturn ret = GST_STATE_CHANGE_SUCCESS;
+  GstSmartPropertiesReturn property_ret;
 
   /* handle upwards state changes here */
   switch (transition) {
+    case GST_STATE_CHANGE_NULL_TO_READY:
+      property_ret = gst_element_get_smart_properties (GST_ELEMENT_CAST (demux),
+          "thumbnail-mode", &demux->thumbnail_mode, "max-gap-time",
+          &demux->max_gap_time, NULL);
+
+      if (property_ret != GST_SMART_PROPERTIES_OK) {
+        GST_WARNING_OBJECT (demux, "faield to get properties");
+      }
+
+      GST_INFO_OBJECT (demux, "thumbnail-mode = %d", demux->thumbnail_mode);
+      GST_INFO_OBJECT (demux, "max-gap-time = %" G_GUINT64_FORMAT,
+          demux->max_gap_time);
+
+      break;
     default:
       break;
   }
@@ -6488,48 +7557,6 @@ gst_matroska_demux_change_state (GstElement * element,
   }
 
   return ret;
-}
-
-static void
-gst_matroska_demux_set_property (GObject * object,
-    guint prop_id, const GValue * value, GParamSpec * pspec)
-{
-  GstMatroskaDemux *demux;
-
-  g_return_if_fail (GST_IS_MATROSKA_DEMUX (object));
-  demux = GST_MATROSKA_DEMUX (object);
-
-  switch (prop_id) {
-    case PROP_MAX_GAP_TIME:
-      GST_OBJECT_LOCK (demux);
-      demux->max_gap_time = g_value_get_uint64 (value);
-      GST_OBJECT_UNLOCK (demux);
-      break;
-    default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
-      break;
-  }
-}
-
-static void
-gst_matroska_demux_get_property (GObject * object,
-    guint prop_id, GValue * value, GParamSpec * pspec)
-{
-  GstMatroskaDemux *demux;
-
-  g_return_if_fail (GST_IS_MATROSKA_DEMUX (object));
-  demux = GST_MATROSKA_DEMUX (object);
-
-  switch (prop_id) {
-    case PROP_MAX_GAP_TIME:
-      GST_OBJECT_LOCK (demux);
-      g_value_set_uint64 (value, demux->max_gap_time);
-      GST_OBJECT_UNLOCK (demux);
-      break;
-    default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
-      break;
-  }
 }
 
 gboolean

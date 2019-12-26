@@ -127,9 +127,6 @@ static GstStaticPadTemplate videosink_templ =
         "video/x-theora; "
         "video/x-dirac, "
         COMMON_VIDEO_CAPS "; "
-        "video/x-pn-realvideo, "
-        "rmversion = (int) [1, 4], "
-        COMMON_VIDEO_CAPS "; "
         "video/x-vp8, "
         COMMON_VIDEO_CAPS "; "
         "video/x-vp9, "
@@ -181,8 +178,6 @@ static GstStaticPadTemplate audiosink_templ =
         "audio/x-tta, "
         "width = (int) { 8, 16, 24 }, "
         "channels = (int) { 1, 2 }, " "rate = (int) [ 8000, 96000 ]; "
-        "audio/x-pn-realaudio, "
-        "raversion = (int) { 1, 2, 8 }, " COMMON_AUDIO_CAPS "; "
         "audio/x-wma, " "wmaversion = (int) [ 1, 3 ], "
         "block_align = (int) [ 0, 65535 ], bitrate = (int) [ 0, 524288 ], "
         COMMON_AUDIO_CAPS ";"
@@ -1257,48 +1252,6 @@ skip_details:
     /* can only make it here if preceding case verified it was version 3 */
     gst_matroska_mux_set_codec_id (context,
         GST_MATROSKA_CODEC_ID_VIDEO_MSMPEG4V3);
-  } else if (!strcmp (mimetype, "video/x-pn-realvideo")) {
-    gint rmversion;
-    const GValue *mdpr_data;
-
-    gst_structure_get_int (structure, "rmversion", &rmversion);
-    switch (rmversion) {
-      case 1:
-        gst_matroska_mux_set_codec_id (context,
-            GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO1);
-        break;
-      case 2:
-        gst_matroska_mux_set_codec_id (context,
-            GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO2);
-        break;
-      case 3:
-        gst_matroska_mux_set_codec_id (context,
-            GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO3);
-        break;
-      case 4:
-        gst_matroska_mux_set_codec_id (context,
-            GST_MATROSKA_CODEC_ID_VIDEO_REALVIDEO4);
-        break;
-      default:
-        goto refuse_caps;
-    }
-
-    mdpr_data = gst_structure_get_value (structure, "mdpr_data");
-    if (mdpr_data != NULL) {
-      guint8 *priv_data = NULL;
-      guint priv_data_size = 0;
-
-      GstBuffer *codec_data_buf = g_value_peek_pointer (mdpr_data);
-
-      priv_data_size = gst_buffer_get_size (codec_data_buf);
-      priv_data = g_malloc0 (priv_data_size);
-
-      gst_buffer_extract (codec_data_buf, 0, priv_data, -1);
-
-      gst_matroska_mux_free_codec_priv (context);
-      context->codec_priv = priv_data;
-      context->codec_priv_size = priv_data_size;
-    }
   } else if (strcmp (mimetype, "video/x-prores") == 0) {
     const gchar *variant;
 
@@ -2037,46 +1990,6 @@ gst_matroska_mux_audio_pad_setcaps (GstPad * pad, GstCaps * caps)
     gst_structure_get_int (structure, "width", &width);
     audiocontext->bitdepth = width;
     gst_matroska_mux_set_codec_id (context, GST_MATROSKA_CODEC_ID_AUDIO_TTA);
-
-  } else if (!strcmp (mimetype, "audio/x-pn-realaudio")) {
-    gint raversion;
-    const GValue *mdpr_data;
-
-    gst_structure_get_int (structure, "raversion", &raversion);
-    switch (raversion) {
-      case 1:
-        gst_matroska_mux_set_codec_id (context,
-            GST_MATROSKA_CODEC_ID_AUDIO_REAL_14_4);
-        break;
-      case 2:
-        gst_matroska_mux_set_codec_id (context,
-            GST_MATROSKA_CODEC_ID_AUDIO_REAL_28_8);
-        break;
-      case 8:
-        gst_matroska_mux_set_codec_id (context,
-            GST_MATROSKA_CODEC_ID_AUDIO_REAL_COOK);
-        break;
-      default:
-        goto refuse_caps;
-    }
-
-    mdpr_data = gst_structure_get_value (structure, "mdpr_data");
-    if (mdpr_data != NULL) {
-      guint8 *priv_data = NULL;
-      guint priv_data_size = 0;
-
-      GstBuffer *codec_data_buf = g_value_peek_pointer (mdpr_data);
-
-      priv_data_size = gst_buffer_get_size (codec_data_buf);
-      priv_data = g_malloc0 (priv_data_size);
-
-      gst_buffer_extract (codec_data_buf, 0, priv_data, -1);
-
-      gst_matroska_mux_free_codec_priv (context);
-
-      context->codec_priv = priv_data;
-      context->codec_priv_size = priv_data_size;
-    }
 
   } else if (!strcmp (mimetype, "audio/x-wma")
       || !strcmp (mimetype, "audio/x-alaw")

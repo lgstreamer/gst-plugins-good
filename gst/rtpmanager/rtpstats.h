@@ -190,7 +190,16 @@ typedef struct {
  * The default and minimum values of the maximum number of missing packets we tolerate.
  * These are packets with asequence number bigger than the last seen packet.
  */
+#if 0
 #define RTP_DEF_DROPOUT      3000
+#else
+/* Cannot detect the Miracast (WiDi) reset case because the
+ * RTP_DEF_DROPOUT value is too high. Sometimes a Miracast device
+ * skips the 500~8000 of the rtp packets, when changing the resolution
+ * or encoder reset. In this case, rtpjitterbuffer should not wait the rtp
+ * packets. So the threshold value 500 is used instead of the 3000. */
+#define RTP_DEF_DROPOUT      500
+#endif
 #define RTP_MIN_DROPOUT      30
 
 /*

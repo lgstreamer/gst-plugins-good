@@ -117,6 +117,11 @@
 #define GST_MATROSKA_ID_TRACKTRANSLATECODEC        0x66BF
 #define GST_MATROSKA_ID_TRACKTRANSLATETRACKID      0x66A5
 
+/* TracksData */
+#define GST_MATROSKA_ID_TRACKSDATA                 0xDA
+#define GST_MATROSKA_ID_TRACKSDATAVERSION          0xDB
+#define GST_MATROSKA_ID_TRACKSDATASIZE             0xDC
+#define GST_MATROSKA_ID_TRACKSDATAPAYLOAD          0xDE
 
 /* IDs in the TrackVideo master */
 /* NOTE: This one is here only for backward compatibility.
@@ -136,6 +141,32 @@
 #define GST_MATROSKA_ID_VIDEOSTEREOMODE            0x53B8
 #define GST_MATROSKA_ID_VIDEOASPECTRATIOTYPE       0x54B3
 #define GST_MATROSKA_ID_VIDEOCOLOURSPACE           0x2EB524
+/* HDR metadata */
+#define GST_MATROSKA_ID_VIDEOCOLOUR                0x55B0
+#define GST_MATROSKA_ID_MATRIXCOEFFICIENTS         0x55B1
+#define GST_MATROSKA_ID_BITSPERCHANNEL             0x55B2
+#define GST_MATROSKA_ID_CHROMASUBSAMPLINGHORZ      0x55B3
+#define GST_MATROSKA_ID_CHROMASUBSAMPLINGVERT      0x55B4
+#define GST_MATROSKA_ID_CBSUBSAMPLINGHORZ          0x55B5
+#define GST_MATROSKA_ID_CBSUBSAMPLINGVERT          0x55B6
+#define GST_MATROSKA_ID_CHROMASITINGHORZ           0x55B7
+#define GST_MATROSKA_ID_CHROMASITINGVERT           0x55B8
+#define GST_MATROSKA_ID_RANGE                      0x55B9
+#define GST_MATROSKA_ID_TRANSFERCHARACTERISTICS    0x55BA
+#define GST_MATROSKA_ID_PRIMARIES                  0x55BB
+#define GST_MATROSKA_ID_MAXCLL                     0x55BC
+#define GST_MATROSKA_ID_MAXFALL                    0x55BD
+#define GST_MATROSKA_ID_MASTERINGMETADATA          0x55D0
+#define GST_MATROSKA_ID_PRIMARYRCHROMATICITYX      0x55D1
+#define GST_MATROSKA_ID_PRIMARYRCHROMATICITYY      0x55D2
+#define GST_MATROSKA_ID_PRIMARYGCHROMATICITYX      0x55D3
+#define GST_MATROSKA_ID_PRIMARYGCHROMATICITYY      0x55D4
+#define GST_MATROSKA_ID_PRIMARYBCHROMATICITYX      0x55D5
+#define GST_MATROSKA_ID_PRIMARYBCHROMATICITYY      0x55D6
+#define GST_MATROSKA_ID_WHITEPOINTCHROMATICITYX    0x55D7
+#define GST_MATROSKA_ID_WHITEPOINTCHROMATICITYY    0x55D8
+#define GST_MATROSKA_ID_LUMINANCEMAX               0x55D9
+#define GST_MATROSKA_ID_LUMINANCEMIN               0x55DA
 /* semi-draft */
 #define GST_MATROSKA_ID_VIDEOGAMMAVALUE            0x2FB523
 
@@ -374,6 +405,8 @@
 #define GST_MATROSKA_CODEC_ID_AUDIO_EAC3           "A_EAC3"
 #define GST_MATROSKA_CODEC_ID_AUDIO_TRUEHD         "A_TRUEHD"
 #define GST_MATROSKA_CODEC_ID_AUDIO_DTS            "A_DTS"
+#define GST_MATROSKA_CODEC_ID_AUDIO_DTS_EXPRESS    "A_DTS/EXPRESS"
+#define GST_MATROSKA_CODEC_ID_AUDIO_DTS_LOSSLESS   "A_DTS/LOSSLESS"
 #define GST_MATROSKA_CODEC_ID_AUDIO_VORBIS         "A_VORBIS"
 #define GST_MATROSKA_CODEC_ID_AUDIO_FLAC           "A_FLAC"
 /* FIXME: not yet in the spec */
@@ -598,12 +631,38 @@ typedef struct _GstMatroskaTrackVideoContext {
 
   GstVideoMultiviewMode multiview_mode;
   GstVideoMultiviewFlags multiview_flags;
+  /* HDR metadata */
+  guint         matrix_coefficients;
+  guint         bits_per_channel;
+  guint         chroma_subsampling_horz;
+  guint         chroma_subsampling_vert;
+  guint         cb_subsampling_horz;
+  guint         cb_subsampling_vert;
+  guint         chroma_siting_horz;
+  guint         chroma_siting_vert;
+  guint         range;
+  guint         transfer_characteristics;
+  guint         primaries;
+  guint         max_CLL;
+  guint         max_FALL;
+  gdouble       primaryR_chromaticityX;
+  gdouble       primaryR_chromaticityY;
+  gdouble       primaryG_chromaticityX;
+  gdouble       primaryG_chromaticityY;
+  gdouble       primaryB_chromaticityX;
+  gdouble       primaryB_chromaticityY;
+  gdouble       white_point_chromaticityX;
+  gdouble       white_point_chromaticityY;
+  gdouble       luminance_max;
+  gdouble       luminance_min;
 
   /* QoS */
   GstClockTime  earliest_time;
 
   GstBuffer     *dirac_unit;
   GstVideoColorimetry colorimetry;
+
+  gint valid_color;
 } GstMatroskaTrackVideoContext;
 
 typedef struct _GstMatroskaTrackAudioContext {

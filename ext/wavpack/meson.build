@@ -4,6 +4,9 @@ wavpack_sources = [
   'gstwavpackdec.c',
   'gstwavpackenc.c',
   'gstwavpackstreamreader.c',
+  'gstwvccombiner.c',
+  'gstwvcmeta.c',
+  'gstwvfilesrc.c',
 ]
 
 wavpack_dep = dependency('wavpack', version : '>= 4.60.0', required : false)

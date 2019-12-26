@@ -2,7 +2,7 @@ audioparsers_src = [
   'gstaacparse.c',
   'gstamrparse.c',
   'gstac3parse.c',
-  'gstdcaparse.c',
+  'gstac4parse.c',
   'gstflacparse.c',
   'gstmpegaudioparse.c',
   'gstsbcparse.c',

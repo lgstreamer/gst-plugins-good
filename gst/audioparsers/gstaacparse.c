@@ -150,6 +150,7 @@ gst_aac_parse_class_init (GstAacParseClass * klass)
 static void
 gst_aac_parse_init (GstAacParse * aacparse)
 {
+  gst_base_parse_set_seek_tolerance (GST_BASE_PARSE (aacparse), 1 * GST_SECOND);
   GST_DEBUG ("initialized");
   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (aacparse));
   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (aacparse));
@@ -221,10 +222,13 @@ gst_aac_parse_set_src_caps (GstAacParse * aacparse, GstCaps * sink_caps)
   s = gst_caps_get_structure (src_caps, 0);
   if (aacparse->sample_rate > 0)
     gst_structure_set (s, "rate", G_TYPE_INT, aacparse->sample_rate, NULL);
-  if (aacparse->channels > 0)
+  if (aacparse->channels >= 0)
     gst_structure_set (s, "channels", G_TYPE_INT, aacparse->channels, NULL);
   if (stream_format)
     gst_structure_set (s, "stream-format", G_TYPE_STRING, stream_format, NULL);
+
+  /* To Support the AAC-ELD */
+  gst_structure_set (s, "object-type", G_TYPE_INT, aacparse->object_type, NULL);
 
   allowed = gst_pad_get_allowed_caps (GST_BASE_PARSE (aacparse)->srcpad);
   if (allowed && !gst_caps_can_intersect (src_caps, allowed)) {
@@ -264,9 +268,6 @@ gst_aac_parse_set_src_caps (GstAacParse * aacparse, GstCaps * sink_caps)
   }
   if (allowed)
     gst_caps_unref (allowed);
-
-  aacparse->last_parsed_channels = 0;
-  aacparse->last_parsed_sample_rate = 0;
 
   GST_DEBUG_OBJECT (aacparse, "setting src caps: %" GST_PTR_FORMAT, src_caps);
 
@@ -448,10 +449,9 @@ gst_aac_parse_check_adts_frame (GstAacParse * aacparse,
 
     /* CRC size test */
     if (*framesize < 7 + crc_size) {
-      *needed_data = 7 + crc_size;
       return FALSE;
     }
-
+#if 0
     /* In EOS mode this is enough. No need to examine the data further.
        We also relax the check when we have sync, on the assumption that
        if we're not looking at random data, we have a much higher chance
@@ -460,6 +460,7 @@ gst_aac_parse_check_adts_frame (GstAacParse * aacparse,
     if (drain || !GST_BASE_PARSE_LOST_SYNC (aacparse)) {
       return TRUE;
     }
+#endif
 
     if (*framesize + ADTS_MAX_SIZE > avail) {
       /* We have found a possible frame header candidate, but can't be
@@ -479,7 +480,11 @@ gst_aac_parse_check_adts_frame (GstAacParse * aacparse,
       gst_base_parse_set_min_frame_size (GST_BASE_PARSE (aacparse),
           nextlen + ADTS_MAX_SIZE);
       return TRUE;
+    } else {
+      GST_DEBUG_OBJECT (aacparse, "That was a false positive");
+      gst_base_parse_set_skipped_frame (GST_BASE_PARSE (aacparse));
     }
+
   }
   return FALSE;
 }
@@ -577,11 +582,16 @@ gst_aac_parse_read_audio_specific_config (GstAacParse * aacparse,
         *channels = 2;
     }
 
+    /* extensionSamplingFrequency belongs to output sampling frequency
+       But the frame duration will be computed based on the input sampling
+       frequency, hence commented the reading of extensionSamplingFrequency here */
+#if 0
     GST_LOG_OBJECT (aacparse,
         "Audio object type 5 or 29, so rereading sampling rate (was %d)...",
         *sample_rate);
     if (!gst_aac_parse_get_audio_sample_rate (aacparse, br, sample_rate))
       return FALSE;
+#endif
 
     if (!gst_aac_parse_get_audio_object_type (aacparse, br, &audio_object_type))
       return FALSE;
@@ -792,6 +802,7 @@ gst_aac_parse_check_loas_frame (GstAacParse * aacparse,
     GST_DEBUG_OBJECT (aacparse, "Found possible %u byte LOAS frame",
         *framesize);
 
+#if 0
     /* In EOS mode this is enough. No need to examine the data further.
        We also relax the check when we have sync, on the assumption that
        if we're not looking at random data, we have a much higher chance
@@ -800,6 +811,7 @@ gst_aac_parse_check_loas_frame (GstAacParse * aacparse,
     if (drain || !GST_BASE_PARSE_LOST_SYNC (aacparse)) {
       return TRUE;
     }
+#endif
 
     if (*framesize + LOAS_MAX_SIZE > avail) {
       /* We have found a possible frame header candidate, but can't be
@@ -821,6 +833,7 @@ gst_aac_parse_check_loas_frame (GstAacParse * aacparse,
       return TRUE;
     } else {
       GST_DEBUG_OBJECT (aacparse, "That was a false positive");
+      gst_base_parse_set_skipped_frame (GST_BASE_PARSE (aacparse));
     }
   }
   return FALSE;
@@ -908,6 +921,8 @@ gst_aac_parse_detect_stream (GstAacParse * aacparse,
   if (!found) {
     if (i)
       *skipsize = i;
+    GST_DEBUG_OBJECT (aacparse, "There is any syncword in this frame");
+    gst_base_parse_set_skipped_frame (GST_BASE_PARSE (aacparse));
     return FALSE;
   }
 
@@ -920,7 +935,7 @@ gst_aac_parse_detect_stream (GstAacParse * aacparse,
     gst_aac_parse_parse_adts_header (aacparse, data, &rate, &channels,
         &aacparse->object_type, &aacparse->mpegversion);
 
-    if (!channels || !framesize) {
+    if (!framesize) {
       GST_DEBUG_OBJECT (aacparse, "impossible ADTS configuration");
       return FALSE;
     }
@@ -1352,7 +1367,10 @@ gst_aac_parse_handle_frame (GstBaseParse * parse,
 
     if (G_UNLIKELY (rate != aacparse->sample_rate
             || channels != aacparse->channels)) {
-      aacparse->sample_rate = rate;
+      /* If the chip support up to 96000,
+       * it is better to change. WOSLQEVENT-11292 */
+      if (rate <= 48000 && rate >= 8000)
+        aacparse->sample_rate = rate;
       aacparse->channels = channels;
 
       if (!gst_aac_parse_set_src_caps (aacparse, NULL)) {

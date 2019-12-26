@@ -291,6 +291,16 @@ struct _GstRTSPSrc {
 
   GstRTSPConnInfo  conninfo;
 
+  GstStructure    *smart_prop;
+  gint            app_type;
+  gchar           *drm_header;
+  gdouble         first_pts;
+  gboolean        remove_drm_header;
+  gboolean        speed_control;
+  gboolean        close_control;
+  guint64         resumed_playpos;
+  gint            timeout_count;
+
   /* a list of RTSP extensions as GstElement */
   GstRTSPExtensionList  *extensions;
 

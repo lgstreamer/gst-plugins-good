@@ -49,4 +49,5 @@ typedef struct _GstMP4Mux GstMP4Mux;
 typedef struct _Gst3GPPMux Gst3GPPMux;
 typedef struct _GstISMLMux GstISMLMux;
 typedef struct _GstMJ2Mux GstMJ2Mux;
+typedef struct _GstDASHMux GstMP4Mux;
 

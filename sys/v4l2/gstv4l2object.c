@@ -42,6 +42,7 @@
 #include "gst/gst-i18n-plugin.h"
 
 #include <gst/video/video.h>
+#include <gst/allocators/gstdmabuf.h>
 
 GST_DEBUG_CATEGORY_EXTERN (v4l2_debug);
 #define GST_CAT_DEFAULT v4l2_debug
@@ -2880,7 +2881,8 @@ gst_v4l2_object_is_dmabuf_supported (GstV4l2Object * v4l2object)
     .flags = O_CLOEXEC | O_RDWR,
   };
 
-  if (v4l2object->fmtdesc->flags & V4L2_FMT_FLAG_EMULATED) {
+  if (v4l2object->fmtdesc &&
+      v4l2object->fmtdesc->flags & V4L2_FMT_FLAG_EMULATED) {
     GST_WARNING_OBJECT (v4l2object->dbg_obj,
         "libv4l2 converter detected, disabling DMABuf");
     ret = FALSE;
@@ -4164,6 +4166,7 @@ gst_v4l2_object_probe_caps (GstV4l2Object * v4l2object, GstCaps * filter)
   GstCaps *ret;
   GSList *walk;
   GSList *formats;
+  gboolean use_dmabuf = FALSE;
 
   formats = gst_v4l2_object_get_format_list (v4l2object);
 
@@ -4188,6 +4191,11 @@ gst_v4l2_object_probe_caps (GstV4l2Object * v4l2object, GstCaps * filter)
     }
   }
 
+  if ((v4l2object->req_mode == GST_V4L2_IO_AUTO
+          || v4l2object->req_mode == GST_V4L2_IO_DMABUF)
+      && gst_v4l2_object_is_dmabuf_supported (v4l2object))
+    use_dmabuf = TRUE;
+
   for (walk = formats; walk; walk = walk->next) {
     struct v4l2_fmtdesc *format;
     GstStructure *template;
@@ -4209,6 +4217,12 @@ gst_v4l2_object_probe_caps (GstV4l2Object * v4l2object, GstCaps * filter)
       GstCaps *format_caps = gst_caps_new_empty ();
 
       gst_caps_append_structure (format_caps, gst_structure_copy (template));
+      /* If we can use dmabuf, duplicate structure with DMABuf caps feature */
+      if (use_dmabuf) {
+        gst_caps_append_structure (format_caps, gst_structure_copy (template));
+        gst_caps_set_features (format_caps, 0,
+            gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_DMABUF, NULL));
+      }
 
       if (!gst_caps_can_intersect (format_caps, filter)) {
         gst_caps_unref (format_caps);
@@ -4221,8 +4235,15 @@ gst_v4l2_object_probe_caps (GstV4l2Object * v4l2object, GstCaps * filter)
 
     tmp = gst_v4l2_object_probe_caps_for_format (v4l2object,
         format->pixelformat, template);
-    if (tmp)
+    if (tmp) {
+      if (use_dmabuf) {
+        GstCaps *caps_dmabuf = gst_caps_copy (tmp);
+        gst_caps_set_features (caps_dmabuf, 0,
+            gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_DMABUF, NULL));
+        gst_caps_append (ret, caps_dmabuf);
+      }
       gst_caps_append (ret, tmp);
+    }
 
     gst_structure_free (template);
   }

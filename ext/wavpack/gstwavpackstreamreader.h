@@ -26,6 +26,7 @@
 
 typedef struct
 {
+  const char *name; /* for logging */
   guint8 *buffer;
   uint32_t length;
   uint32_t position;

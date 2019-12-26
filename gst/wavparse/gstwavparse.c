@@ -1857,9 +1857,11 @@ gst_wavparse_send_event (GstElement * element, GstEvent * event)
 }
 
 static gboolean
-gst_wavparse_have_dts_caps (const GstCaps * caps, GstTypeFindProbability prob)
+gst_wavparse_have_dts_caps (const GstCaps * caps, GstTypeFindProbability prob,
+    gint wavHdFrRate)
 {
   GstStructure *s;
+  gint dtsHdFrRate = 0;
 
   s = gst_caps_get_structure (caps, 0);
   if (!gst_structure_has_name (s, "audio/x-dts"))
@@ -1871,14 +1873,22 @@ gst_wavparse_have_dts_caps (const GstCaps * caps, GstTypeFindProbability prob)
    *    to be DTS.  */
   if (prob > GST_TYPE_FIND_LIKELY)
     return TRUE;
-  if (prob <= GST_TYPE_FIND_POSSIBLE)
+  if (prob < GST_TYPE_FIND_POSSIBLE)
     return FALSE;
   /* for maybe, check for at least a valid-looking rate and channels */
   if (!gst_structure_has_field (s, "channels"))
     return FALSE;
   /* and for extra assurance we could also check the rate from the DTS frame
-   * against the one in the wav header, but for now let's not do that */
-  return gst_structure_has_field (s, "rate");
+   * against the one in the wav header */
+  if ((gst_structure_get_int (s, "rate", &dtsHdFrRate)) && wavHdFrRate) {
+    GST_LOG ("DTS header frame rate = %d, Wav header frame rate = %d",
+        dtsHdFrRate, wavHdFrRate);
+    if (dtsHdFrRate == wavHdFrRate)
+      return TRUE;
+    else
+      return FALSE;
+  } else
+    return FALSE;
 }
 
 static GstTagList *
@@ -1917,11 +1927,14 @@ gst_wavparse_add_src_pad (GstWavParse * wav, GstBuffer * buf)
   if (s && gst_structure_has_name (s, "audio/x-raw") && buf != NULL) {
     GstTypeFindProbability prob;
     GstCaps *tf_caps;
+    gint wavHdFrRate = 0;
 
     tf_caps = gst_type_find_helper_for_buffer (GST_OBJECT (wav), buf, &prob);
     if (tf_caps != NULL) {
       GST_LOG ("typefind caps = %" GST_PTR_FORMAT ", P=%d", tf_caps, prob);
-      if (gst_wavparse_have_dts_caps (tf_caps, prob)) {
+      gst_structure_get_int (s, "rate", &wavHdFrRate);
+
+      if (gst_wavparse_have_dts_caps (tf_caps, prob, wavHdFrRate)) {
         GST_INFO_OBJECT (wav, "Found DTS marker in file marked as raw PCM");
         gst_caps_unref (wav->caps);
         wav->caps = tf_caps;

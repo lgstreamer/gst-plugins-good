@@ -52,6 +52,13 @@ typedef enum
   FLV_STATE_NONE
 } GstFlvDemuxState;
 
+typedef enum
+{
+  FLV_SEEK_STATE_PARSE_TAG_TYPE,
+  FLV_SEEK_STATE_PARSE_TAG_DATA,
+  FLV_SEEK_STATE_NONE
+} GstFlvDemuxSeekState;
+
 struct _GstFlvDemux
 {
   GstElement element;
@@ -65,13 +72,13 @@ struct _GstFlvDemux
   guint group_id;
 
   /* <private> */
-  
+
   GstIndex *index;
   gint index_id;
   gboolean own_index;
-  
-  GArray * times;
-  GArray * filepositions;
+
+  GArray *times;
+  GArray *filepositions;
 
   GstAdapter *adapter;
 
@@ -102,7 +109,7 @@ struct _GstFlvDemux
   gboolean audio_need_discont;
   gboolean audio_need_segment;
   gboolean audio_linked;
-  GstBuffer * audio_codec_data;
+  GstBuffer *audio_codec_data;
   GstClockTime audio_start;
   guint32 last_audio_pts;
   GstClockTime audio_time_offset;
@@ -118,7 +125,7 @@ struct _GstFlvDemux
   gboolean video_need_segment;
   gboolean video_linked;
   gboolean got_par;
-  GstBuffer * video_codec_data;
+  GstBuffer *video_codec_data;
   GstClockTime video_start;
   guint32 last_video_dts;
   GstClockTime video_time_offset;
@@ -140,11 +147,12 @@ struct _GstFlvDemux
 
   gboolean seeking;
   gboolean building_index;
-  gboolean indexed; /* TRUE if index is completely built */
-  gboolean upstream_seekable; /* TRUE if upstream is seekable */
+  gboolean indexed;             /* TRUE if index is completely built */
+  gboolean upstream_seekable;   /* TRUE if upstream is seekable */
   gint64 file_size;
   GstEvent *seek_event;
   gint64 seek_time;
+  GstFlvDemuxSeekState seek_state;
 
   GstClockTime index_max_time;
   gint64 index_max_pos;
@@ -156,6 +164,28 @@ struct _GstFlvDemux
   gboolean audio_done;
   gint64 from_offset;
   gint64 to_offset;
+
+  /* For Smart properties */
+  guint32 dlna_opval;
+  guint32 dlna_flagval;
+  guint64 dlna_duration;
+  guint64 dlna_filelength;
+
+  gboolean thumbnail_mode;      /*thumbnail flag */
+  gboolean invalid_keyframe;    /* whether if times tag or filepositions tag in metadata is exist or not */
+  gboolean unsupported_codec;
+
+  gboolean rate_is_changed;
+  gint64 prev_seek_offset;
+  GstSegment seeksegment;
+  gboolean resuming;
+
+  /* Trick play support */
+  gdouble play_rate;
+  gboolean high_speed_trick;
+  gboolean iframe_push_done;
+  gboolean audio_push_done;
+  gboolean ignore_flush;
 };
 
 struct _GstFlvDemuxClass

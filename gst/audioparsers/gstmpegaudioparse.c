@@ -220,6 +220,7 @@ gst_mpeg_audio_parse_reset (GstMpegAudioParse * mp3parse)
 
   mp3parse->encoder_delay = 0;
   mp3parse->encoder_padding = 0;
+  mp3parse->mpegvalid = FALSE;
 }
 
 static void
@@ -486,6 +487,7 @@ gst_mpeg_audio_parse_head_check (GstMpegAudioParse * mp3parse,
     /* Ignore this as there are some files with emphasis 0x2 that can
      * be played fine. See BGO #537235 */
     GST_WARNING_OBJECT (mp3parse, "invalid emphasis: 0x%lx", head & 0x3);
+    mp3parse->mpegvalid = TRUE;
   }
 
   return TRUE;
@@ -600,6 +602,48 @@ gst_mp3parse_find_freerate (GstMpegAudioParse * mp3parse, GstMapInfo * map,
   return TRUE;
 }
 
+static gboolean
+gst_mpeg_audio_parse_set_src_caps (GstBaseParse * parse, GstCaps * sink_caps)
+{
+  GstMpegAudioParse *mp3parse = GST_MPEG_AUDIO_PARSE (parse);
+  GstStructure *s;
+  gboolean res = FALSE;
+  gboolean update_caps = FALSE;
+  gint layer = 0, rate = 0, channels = 0, version = 0;
+
+  GST_DEBUG_OBJECT (mp3parse, "sink caps: %" GST_PTR_FORMAT, sink_caps);
+  if (sink_caps) {
+    update_caps = TRUE;
+    s = gst_caps_get_structure (sink_caps, 0);
+    gst_structure_get_int (s, "mpegversion", &version);
+    gst_structure_get_int (s, "layer", &layer);
+    if (!gst_structure_get_int (s, "rate", &rate))
+      update_caps = FALSE;
+    if (!gst_structure_get_int (s, "channels", &channels))
+      update_caps = FALSE;
+    if (rate == 0 || channels == 0)
+      update_caps = FALSE;
+    GST_DEBUG ("mpegaudioversion = %d layer = %d rate = %d channels = %d",
+        version, layer, rate, channels);
+  } else {
+    GST_DEBUG_OBJECT (mp3parse, "There is no sink_caps!");
+  }
+
+
+  if (G_UNLIKELY (update_caps)) {
+    GstCaps *caps = gst_caps_new_simple ("audio/mpeg",
+        "mpegversion", G_TYPE_INT, 1,
+        "mpegaudioversion", G_TYPE_INT, version,
+        "layer", G_TYPE_INT, layer,
+        "rate", G_TYPE_INT, rate,
+        "channels", G_TYPE_INT, channels, "parsed", G_TYPE_BOOLEAN, TRUE, NULL);
+    res = gst_pad_set_caps (GST_BASE_PARSE_SRC_PAD (parse), caps);
+    gst_caps_unref (caps);
+  }
+
+  return res;
+}
+
 static GstFlowReturn
 gst_mpeg_audio_parse_handle_frame (GstBaseParse * parse,
     GstBaseParseFrame * frame, gint * skipsize)
@@ -613,6 +657,10 @@ gst_mpeg_audio_parse_handle_frame (GstBaseParse * parse,
   guint bitrate, layer, rate, channels, version, mode, crc;
   GstMapInfo map;
   gboolean res = FALSE;
+  guint64 dummyskipsize = 0;
+  const guint8 *dummydata;
+  guint64 dummysize;
+  gint i, a_header_size;
 
   gst_buffer_map (buf, &map, GST_MAP_READ);
   if (G_UNLIKELY (map.size < 6)) {
@@ -622,8 +670,61 @@ gst_mpeg_audio_parse_handle_frame (GstBaseParse * parse,
 
   gst_byte_reader_init (&reader, map.data, map.size);
 
+  dummydata = map.data;
+  dummysize = map.size;
+
+  while (dummyskipsize < dummysize && dummydata[dummyskipsize] == 0xff) {
+    dummyskipsize++;
+  }
+  /* make sure the values in the frame header look sense */
+  if (dummyskipsize > 1) {
+    header = GST_READ_UINT32_BE (&dummydata[dummyskipsize - 1]);
+    if (!gst_mpeg_audio_parse_head_check (mp3parse, header)) {
+      dummyskipsize--;
+    }
+    if (mp3parse->mpegvalid) {
+      dummyskipsize--;
+    }
+  }
+
+  a_header_size = 2;            /*acceptable header size as 0xff */
+
+  if (dummyskipsize > a_header_size) {
+    GstCaps *sinkCaps = NULL, *srcCaps = NULL;
+    if (dummyskipsize != dummysize)
+      dummyskipsize--;
+
+    srcCaps = gst_pad_get_current_caps (GST_BASE_PARSE_SRC_PAD (parse));
+
+    if (!srcCaps) {
+      sinkCaps = gst_pad_get_current_caps (GST_BASE_PARSE_SINK_PAD (parse));
+      if (sinkCaps) {
+        if (gst_mpeg_audio_parse_set_src_caps (parse, sinkCaps))
+          GST_DEBUG_OBJECT (mp3parse, "Set src pad caps using sink's");
+        else
+          GST_WARNING_OBJECT (mp3parse,
+              "CAN NOT set src pad caps using sink's");
+
+        gst_buffer_unmap (buf, &map);
+        gst_caps_unref (sinkCaps);
+        return gst_base_parse_finish_frame (parse, frame, dummyskipsize);
+      } else
+        dummyskipsize = 0;
+    } else {
+      gst_buffer_unmap (buf, &map);
+      gst_caps_unref (srcCaps);
+      return gst_base_parse_finish_frame (parse, frame, dummyskipsize);
+    }
+  }
+
+  for (i = 0; i < a_header_size; i++) {
+    if (dummyskipsize > 0) {
+      dummyskipsize--;
+    }
+  }
+
   off = gst_byte_reader_masked_scan_uint32 (&reader, 0xffe00000, 0xffe00000,
-      0, map.size);
+      dummyskipsize, map.size);
 
   GST_LOG_OBJECT (parse, "possible sync at buffer offset %d", off);
 
@@ -658,9 +759,12 @@ gst_mpeg_audio_parse_handle_frame (GstBaseParse * parse,
       &version, &layer, &channels, &bitrate, &rate, &mode, &crc);
 
   if (channels != mp3parse->channels || rate != mp3parse->rate ||
-      layer != mp3parse->layer || version != mp3parse->version)
-    caps_change = TRUE;
-  else
+      layer != mp3parse->layer || version != mp3parse->version) {
+    if (mp3parse->layer != 0 && layer != mp3parse->layer)
+      caps_change = FALSE;
+    else
+      caps_change = TRUE;
+  } else
     caps_change = FALSE;
 
   /* maybe free format */

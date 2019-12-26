@@ -91,6 +91,10 @@ gboolean qtdemux_dump_fLaC (GstQTDemux * qtdemux, GstByteReader * data,
     int depth);
 gboolean qtdemux_dump_gmin (GstQTDemux * qtdemux, GstByteReader * data,
     int depth);
+gboolean qtdemux_dump_sbgp (GstQTDemux * qtdemux, GstByteReader * data,
+    int depth);
+gboolean qtdemux_dump_sgpd (GstQTDemux * qtdemux, GstByteReader * data,
+    int depth);
 
 gboolean qtdemux_node_dump (GstQTDemux * qtdemux, GNode * node);
 

@@ -73,6 +73,7 @@ check_headers = [
   ['HAVE_SYS_TIME_H', 'sys/time.h'],
   ['HAVE_SYS_TYPES_H', 'sys/types.h'],
   ['HAVE_UNISTD_H', 'unistd.h'],
+  ['HAVE_V4L2_EXT_H', 'linux/v4l2-ext/videodev2-ext.h'],
 ]
 
 foreach h : check_headers

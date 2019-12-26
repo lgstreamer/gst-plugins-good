@@ -94,6 +94,7 @@ struct _GstMpegAudioParse {
   /* LAME info */
   guint32      encoder_delay;
   guint32      encoder_padding;
+  gboolean     mpegvalid;
 };
 
 /**

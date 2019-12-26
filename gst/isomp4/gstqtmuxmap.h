@@ -56,7 +56,8 @@ typedef enum _GstQTMuxFormat
   GST_QT_MUX_FORMAT_MP4,
   GST_QT_MUX_FORMAT_3GP,
   GST_QT_MUX_FORMAT_MJ2,
-  GST_QT_MUX_FORMAT_ISML
+  GST_QT_MUX_FORMAT_ISML,
+  GST_QT_MUX_FORMAT_DASH
 } GstQTMuxFormat;
 
 typedef struct _GstQTMuxFormatProp

@@ -54,6 +54,7 @@ struct _GstWavpackDec
   WavpackStreamReader *stream_reader;
 
   read_id wv_id;
+  read_id wvc_id;
 
   gint sample_rate;
   gint depth;

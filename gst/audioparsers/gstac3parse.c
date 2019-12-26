@@ -212,6 +212,7 @@ gst_ac3_parse_reset (GstAc3Parse * ac3parse)
   ac3parse->eac = FALSE;
   ac3parse->sent_codec_tag = FALSE;
   g_atomic_int_set (&ac3parse->align, GST_AC3_PARSE_ALIGN_NONE);
+  ac3parse->is_atmos = FALSE;
 }
 
 static void
@@ -285,6 +286,9 @@ gst_ac3_parse_set_alignment (GstAc3Parse * ac3parse, gboolean eac)
         GST_WARNING_OBJECT (ac3parse, "unknown alignment: %s", str);
       }
       break;
+    } else {
+      g_atomic_int_set (&ac3parse->align, GST_AC3_PARSE_ALIGN_IEC61937);
+      GST_DEBUG_OBJECT (ac3parse, "set as iec61937 alignment of EAC-3");
     }
   }
 
@@ -469,15 +473,11 @@ gst_ac3_parse_frame_header (GstAc3Parse * parse, GstBuffer * buf, gint skip,
     ret = gst_ac3_parse_frame_header_ac3 (parse, buf, skip, framesize, rate,
         chans, blocks, sid);
     goto cleanup;
-  } else if (bsid <= 16) {
+  } else {
     if (eac)
       *eac = TRUE;
     ret = gst_ac3_parse_frame_header_eac3 (parse, buf, skip, framesize, rate,
         chans, blocks, sid);
-    goto cleanup;
-  } else {
-    GST_DEBUG_OBJECT (parse, "unexpected bsid %d", bsid);
-    ret = FALSE;
     goto cleanup;
   }
 
@@ -621,7 +621,7 @@ gst_ac3_parse_handle_frame (GstBaseParse * parse,
   ret = TRUE;
 
   /* arrange for metadata setup */
-  if (G_UNLIKELY (sid)) {
+  if (G_UNLIKELY (sid) && !more) {
     /* dependent frame, no need to (ac)count for or consider further */
     GST_LOG_OBJECT (parse, "sid: %d", sid);
     frame->flags |= GST_BASE_PARSE_FRAME_FLAG_NO_FRAME;
@@ -643,6 +643,8 @@ gst_ac3_parse_handle_frame (GstBaseParse * parse,
     gst_caps_set_simple (caps, "alignment", G_TYPE_STRING,
         g_atomic_int_get (&ac3parse->align) == GST_AC3_PARSE_ALIGN_IEC61937 ?
         "iec61937" : "frame", NULL);
+    if (ac3parse->is_atmos)
+      gst_caps_set_simple (caps, "immersive", G_TYPE_STRING, "ATMOS", NULL);
     gst_pad_set_caps (GST_BASE_PARSE_SRC_PAD (parse), caps);
     gst_caps_unref (caps);
 
@@ -948,6 +950,10 @@ gst_ac3_parse_set_sink_caps (GstBaseParse * parse, GstCaps * caps)
     gst_pad_set_chain_function (parse->sinkpad, gst_ac3_parse_chain_priv);
   } else {
     gst_pad_set_chain_function (parse->sinkpad, ac3parse->baseparse_chainfunc);
+  }
+  /* Store ATMOS information from upstream element */
+  if (gst_structure_get_string (s, "immersive")) {
+    ac3parse->is_atmos = TRUE;
   }
   return TRUE;
 }

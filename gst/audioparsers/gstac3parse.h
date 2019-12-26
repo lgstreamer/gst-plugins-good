@@ -63,6 +63,7 @@ struct _GstAc3Parse {
   gboolean              eac;
   gboolean              sent_codec_tag;
   volatile gint         align;
+  gboolean              is_atmos;
   GstPadChainFunction   baseparse_chainfunc;
 };
 

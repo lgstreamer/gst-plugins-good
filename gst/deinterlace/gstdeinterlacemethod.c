@@ -66,6 +66,7 @@ gst_deinterlace_method_supported_impl (GstDeinterlaceMethodClass * klass,
     case GST_VIDEO_FORMAT_Y42B:
       return (klass->deinterlace_frame_y42b != NULL);
     case GST_VIDEO_FORMAT_Y41B:
+    case GST_VIDEO_FORMAT_YUV9:
       return (klass->deinterlace_frame_y41b != NULL);
     case GST_VIDEO_FORMAT_AYUV:
       return (klass->deinterlace_frame_ayuv != NULL);
@@ -138,6 +139,7 @@ gst_deinterlace_method_setup_impl (GstDeinterlaceMethod * self,
       self->deinterlace_frame = klass->deinterlace_frame_y42b;
       break;
     case GST_VIDEO_FORMAT_Y41B:
+    case GST_VIDEO_FORMAT_YUV9:
       self->deinterlace_frame = klass->deinterlace_frame_y41b;
       break;
     case GST_VIDEO_FORMAT_AYUV:
@@ -277,6 +279,7 @@ gst_deinterlace_simple_method_supported (GstDeinterlaceMethodClass * mklass,
     case GST_VIDEO_FORMAT_Y444:
     case GST_VIDEO_FORMAT_Y42B:
     case GST_VIDEO_FORMAT_Y41B:
+    case GST_VIDEO_FORMAT_YUV9:
       return (klass->interpolate_scanline_planar_y != NULL
           && klass->copy_scanline_planar_y != NULL &&
           klass->interpolate_scanline_planar_u != NULL
@@ -678,6 +681,7 @@ gst_deinterlace_simple_method_setup (GstDeinterlaceMethod * method,
     case GST_VIDEO_FORMAT_Y444:
     case GST_VIDEO_FORMAT_Y42B:
     case GST_VIDEO_FORMAT_Y41B:
+    case GST_VIDEO_FORMAT_YUV9:
       self->interpolate_scanline_planar[0] =
           klass->interpolate_scanline_planar_y;
       self->copy_scanline_planar[0] = klass->copy_scanline_planar_y;

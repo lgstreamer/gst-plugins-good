@@ -177,6 +177,32 @@ typedef struct _AtomFTYP
   guint32 compatible_brands_size;
 } AtomFTYP;
 
+typedef struct _SIDXEntry
+{
+  gboolean ref_type;
+  guint32 ref_size;
+  guint32 subsegment_duration;
+  gboolean start_with_sap;
+  guint8 sap_type;
+  guint32 sap_delta_time;
+} SIDXEntry;
+
+typedef struct _AtomSIDX
+{
+  AtomFull header;
+
+  guint32 ref_id;
+  guint32 timescale;
+
+  /* version 0: 32 bits */
+  guint64 earlist_pts;
+  guint64 first_offset;
+
+  guint16 reserved;
+
+  ATOM_ARRAY (SIDXEntry) entries;
+} AtomSIDX;
+
 typedef struct _AtomMVHD
 {
   AtomFull header;
@@ -978,6 +1004,7 @@ guint64    atom_stco64_copy_data       (AtomSTCO64 *atom, guint8 **buffer,
 AtomMOOF*  atom_moof_new               (AtomsContext *context, guint32 sequence_number);
 void       atom_moof_free              (AtomMOOF *moof);
 guint64    atom_moof_copy_data         (AtomMOOF *moof, guint8 **buffer, guint64 *size, guint64* offset);
+void       atom_moof_add_traf          (AtomMOOF *moof, AtomTRAF *traf);
 AtomTRAF * atom_traf_new               (AtomsContext * context, guint32 track_ID);
 void       atom_traf_free              (AtomTRAF * traf);
 void       atom_traf_set_base_decode_time (AtomTRAF * traf, guint64 base_decode_time);
@@ -985,7 +1012,6 @@ void       atom_traf_add_samples       (AtomTRAF * traf, guint32 delta,
                                         guint32 size, gboolean sync, gint64 pts_offset,
                                         gboolean sdtp_sync);
 guint32    atom_traf_get_sample_num    (AtomTRAF * traf);
-void       atom_moof_add_traf          (AtomMOOF *moof, AtomTRAF *traf);
 
 AtomMFRA*  atom_mfra_new               (AtomsContext *context);
 void       atom_mfra_free              (AtomMFRA *mfra);
@@ -994,6 +1020,19 @@ void       atom_tfra_add_entry         (AtomTFRA *tfra, guint64 dts, guint32 sam
 void       atom_tfra_update_offset     (AtomTFRA * tfra, guint64 offset);
 void       atom_mfra_add_tfra          (AtomMFRA *mfra, AtomTFRA *tfra);
 guint64    atom_mfra_copy_data         (AtomMFRA *mfra, guint8 **buffer, guint64 *size, guint64* offset);
+
+AtomFTYP*  atom_styp_new               (AtomsContext *context, guint32 major,
+                                        guint32 version, GList *brands);
+AtomSIDX*  atom_sidx_new               (AtomsContext * context, guint32 reference_id,
+                                        guint64 dts, guint32 timescale,
+                                        guint64 earlist_pts, guint64 first_offset);
+void       atom_sidx_free              (AtomSIDX * sidx);
+void       atom_sidx_add_entry         (AtomSIDX * sidx, gboolean ref_type,
+                                        guint32 ref_size, guint32 sub_duration,
+                                        gboolean start_with_sap, guint8 sap_type,
+                                        guint32 sap_delta_time);
+guint64    atom_sidx_copy_data         (AtomSIDX * sidx, guint8 ** buffer,
+                                        guint64 * size, guint64 * offset);
 
 
 /* media sample description related helpers */
@@ -1097,6 +1136,7 @@ AtomInfo *   build_SMI_atom              (const GstBuffer *seqh);
 AtomInfo *   build_ima_adpcm_extension   (gint channels, gint rate,
                                           gint blocksize);
 AtomInfo *   build_uuid_xmp_atom         (GstBuffer * xmp);
+AtomInfo *   build_uuid_dvr_atom         (void);
 
 
 /*

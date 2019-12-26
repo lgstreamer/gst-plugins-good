@@ -113,6 +113,20 @@ typedef struct _GstMatroskaDemux {
 
   /* Cached upstream length (default G_MAXUINT64) */
   guint64	           cached_length;
+  guint                    thumbnail_mode;
+  gint8                    h264_codec;
+
+  gboolean                 skip_find_next_keyframe;
+  gboolean                 keyframe_push_done;
+  gboolean                 is_higher_than_FHD;
+  gboolean                 has_audio;
+  guint64                  audio_frame_push_ref;
+  guint64                  audio_frame_push_check;
+  gboolean                 audio_frame_push_done;
+  gdouble                  seek_rate;
+  gboolean                 is_rate_changed;
+  gboolean                 scan_next_cluster_push;
+  gboolean                 is_flushing;
 } GstMatroskaDemux;
 
 typedef struct _GstMatroskaDemuxClass {
