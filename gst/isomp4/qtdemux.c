@@ -654,6 +654,8 @@ static void qtdemux_gst_structure_free (GstStructure * gststructure);
 static void gst_qtdemux_reset (GstQTDemux * qtdemux, gboolean hard);
 
 #ifdef DOLBYHDR_SUPPORT
+static gboolean gst_qtdemux_check_dolby_vision_compatibility (GstQTDemux *
+    qtdemux);
 static gboolean qtdemux_prepare_dolby_track (GstQTDemux * qtdemux,
     QtDemuxStream * stream);
 #endif
@@ -2461,6 +2463,7 @@ gst_qtdemux_reset (GstQTDemux * qtdemux, gboolean hard)
     qtdemux->rpu_present_flag = FALSE;
     qtdemux->el_present_flag = FALSE;
     qtdemux->bl_present_flag = FALSE;
+    qtdemux->dv_bl_signal_comp_id = -1;
 #endif
     qtdemux->isInterleaved = TRUE;
     qtdemux->isBigData = FALSE;
@@ -3191,13 +3194,9 @@ qtdemux_parse_piff (GstQTDemux * qtdemux, const guint8 * buffer, gint length,
     return;
   }
 
-  if (qtdemux->protection_system_ids && qtdemux->protection_system_ids->len > 0) {
-    GST_DEBUG_OBJECT (qtdemux, "we've got protection_system id's already");
-  } else {
-    gst_structure_get (structure, GST_PROTECTION_SYSTEM_ID_CAPS_FIELD,
-        G_TYPE_STRING, &system_id, NULL);
-    gst_qtdemux_append_protection_system_id (qtdemux, system_id);
-  }
+  gst_structure_get (structure, GST_PROTECTION_SYSTEM_ID_CAPS_FIELD,
+      G_TYPE_STRING, &system_id, NULL);
+  gst_qtdemux_append_protection_system_id (qtdemux, system_id);
 
   stream->protected = TRUE;
   stream->protection_scheme_type = FOURCC_cenc;
@@ -4518,11 +4517,7 @@ qtdemux_parse_pssh (GstQTDemux * qtdemux, GNode * node)
   sysid_string =
       qtdemux_uuid_bytes_to_string ((const guint8 *) node->data + 12);
 
-  if (qtdemux->protection_system_ids && qtdemux->protection_system_ids->len > 0) {
-    GST_DEBUG_OBJECT (qtdemux, "we've got protection_system id's already");
-  } else {
-    gst_qtdemux_append_protection_system_id (qtdemux, sysid_string);
-  }
+  gst_qtdemux_append_protection_system_id (qtdemux, sysid_string);
 
   pssh = gst_buffer_new_wrapped (g_memdup (node->data, pssh_size), pssh_size);
   GST_LOG_OBJECT (qtdemux, "cenc pssh size: %" G_GSIZE_FORMAT,
@@ -5793,6 +5788,11 @@ gst_qtdemux_stream_update_segment (GstQTDemux * qtdemux, QtDemuxStream * stream,
           "Push gap to audio since we are no audio trick");
       gst_pad_push_event (stream->pad,
           gst_event_new_gap (stream->segment.start, GST_CLOCK_TIME_NONE));
+    }
+    if (CUR_STREAM (stream)->sparse) {
+      GST_INFO_OBJECT (stream->pad, "Sending gap event on subtitle stream");
+      gst_pad_push_event (stream->pad,
+          gst_event_new_gap (stream->segment.position, GST_CLOCK_TIME_NONE));
     }
   }
 
@@ -8644,13 +8644,14 @@ qtdemux_parse_node (GstQTDemux * qtdemux, GNode * node, const guint8 * buffer,
         qtdemux->rpu_present_flag = (QT_UINT8 (buffer + 11) >> 2) & 0x01;
         qtdemux->el_present_flag = (QT_UINT8 (buffer + 11) >> 1) & 0x01;
         qtdemux->bl_present_flag = QT_UINT8 (buffer + 11) & 0x01;
+        qtdemux->dv_bl_signal_comp_id = (QT_UINT8 (buffer + 12) >> 4) & 0x0f;
 
         GST_LOG_OBJECT (qtdemux,
             "%" GST_FOURCC_FORMAT ", dv_profile = %d, rpu_present_flag = %d, "
-            "el_present_flag = %d, bl_present_flag = %d",
+            "el_present_flag = %d, bl_present_flag = %d, dv_bl_signal_comp_id = %d",
             GST_FOURCC_ARGS (fourcc), qtdemux->dv_profile,
             qtdemux->rpu_present_flag, qtdemux->el_present_flag,
-            qtdemux->bl_present_flag);
+            qtdemux->bl_present_flag, qtdemux->dv_bl_signal_comp_id);
 
         qtdemux_parse_container (qtdemux, node, buffer + 0x20, end);
         qtdemux->is_dolby_hdr = TRUE;
@@ -16162,6 +16163,34 @@ is_common_enc_scheme_type (guint32 scheme_type)
 
 #ifdef DOLBYHDR_SUPPORT
 static gboolean
+gst_qtdemux_check_dolby_vision_compatibility (GstQTDemux * qtdemux)
+{
+  gboolean res = TRUE;
+
+  /* BL signal cross-compatibility ID
+   * 0: None
+   * 1: HDR10
+   * 2: SDR
+   * 4: HLG
+   * 6: UHD Blu-ray Disc HDR */
+  switch (qtdemux->dv_profile) {
+    case 1:
+    case 3:
+    case 5:
+      res = FALSE;
+      break;
+    case 10:
+      if (qtdemux->dv_bl_signal_comp_id == 0)
+        res = FALSE;
+      break;
+    default:
+      break;
+  }
+
+  return res;
+}
+
+static gboolean
 qtdemux_prepare_dolby_track (GstQTDemux * qtdemux, QtDemuxStream * stream)
 {
   g_return_val_if_fail (stream != NULL, FALSE);
@@ -16187,19 +16216,25 @@ qtdemux_prepare_dolby_track (GstQTDemux * qtdemux, QtDemuxStream * stream)
 
   /* 1. Check profile and supportability */
   if (!qtdemux->dolby_vision_support) {
-    if (qtdemux->dv_profile == 1 || qtdemux->dv_profile == 3
-        || qtdemux->dv_profile == 5) {
+    if (!gst_qtdemux_check_dolby_vision_compatibility (qtdemux)) {
       /* if following conditions are met, "no playable stream error" will be posted
        * - Dolby Vision cannot be supported by this platform
-       * - non-backward compatible profile (i.e., profile 1, 3, and 5)
+       * - non-backward compatible profile (i.e., profile 1, 3, 5, 10.00)
        */
       GST_ELEMENT_ERROR (qtdemux, STREAM, DEMUX,
           (_("This file contains no playable streams.")),
-          ("This profileID %d of DolbyVision is not supported cross-compatibility.",
-              qtdemux->dv_profile));
+          ("This profileID [%d], compID [%d] of DolbyVision is not supported cross-compatibility.",
+              qtdemux->dv_profile, qtdemux->dv_bl_signal_comp_id));
       return FALSE;
     }
   } else {
+    /* FIXME: Handle as BL signal compatibility for not-certified profileID.
+     * Do not send dolby-vision signal to avoid opening with Dolby driver */
+    if (qtdemux->dv_profile == 7) {
+      GST_DEBUG_OBJECT (qtdemux, "profileID [%d] does not handle as Dolby Vision", qtdemux->dv_profile);
+      return FALSE;
+    }
+
     GST_DEBUG_OBJECT (qtdemux, "Set dolby-vision TRUE");
     gst_caps_set_simple (CUR_STREAM (stream)->caps, "dolby-vision",
         G_TYPE_BOOLEAN, TRUE, NULL);

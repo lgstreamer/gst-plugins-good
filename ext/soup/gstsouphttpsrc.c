@@ -1893,7 +1893,8 @@ gst_soup_http_src_build_message (GstSoupHTTPSrc * src, const gchar * method)
         G_CALLBACK (gst_soup_http_src_restarted_cb), src);
   }
 
-  if (src->time_seek_flag) {
+/* opval 0x10 stands for DLNA time seek contents */
+  if (src->opval == 0x10) {
     gst_soup_http_src_add_time_seek_range_header (src, src->request_time);
   } else {
     gst_soup_http_src_add_range_header (src, src->request_position,

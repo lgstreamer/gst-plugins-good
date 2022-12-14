@@ -42,14 +42,19 @@ G_BEGIN_DECLS
 #define GST_V4L2_BUFFER_POOL_CAST(obj) ((GstV4l2BufferPool*)(obj))
 
 /* This flow return is used to indicated that the last buffer of a
- * drain or a resoltuion change has been found. This should normally
- * only occure for mem-2-mem devices. */
+ * drain or a resolution change has been found. This should normally
+ * only occur for mem-2-mem devices. */
 #define GST_V4L2_FLOW_LAST_BUFFER GST_FLOW_CUSTOM_SUCCESS
 
 /* This flow return is used to indicated that the returned buffer was marked
  * with the error flag and had no payload. This error should be recovered by
  * simply waiting for next buffer. */
 #define GST_V4L2_FLOW_CORRUPTED_BUFFER GST_FLOW_CUSTOM_SUCCESS_1
+
+/* This flow return is used to indicated that the last buffer of a
+ * resolution change has been found. This should normally only
+ * occur for mem-2-mem devices. */
+#define GST_V4L2_FLOW_SOURCE_CHANGE GST_FLOW_CUSTOM_SUCCESS_2
 
 struct _GstV4l2BufferPool
 {

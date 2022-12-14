@@ -344,8 +344,10 @@ G_BEGIN_DECLS
 /* Dolby HDR */
 #define FOURCC_dby1     GST_MAKE_FOURCC('d','b','y','1')
 #define FOURCC_dvcC     GST_MAKE_FOURCC('d','v','c','C')
+#define FOURCC_dvvC     GST_MAKE_FOURCC('d','v','v','C')
 #define FOURCC_dvav     GST_MAKE_FOURCC('d','v','a','v')
 #define FOURCC_dvhe     GST_MAKE_FOURCC('d','v','h','e')
+#define FOURCC_dvh1     GST_MAKE_FOURCC('d','v','h','1')
 
 /* For Microsoft Wave formats embedded in quicktime, the FOURCC is
    'm', 's', then the 16 bit wave codec id */

@@ -50,6 +50,7 @@
 
 #include <gst/video/gstvideometa.h>
 #include <gst/video/gstvideopool.h>
+#include <gst/allocators/gstdmabuf.h>
 
 #include "gstv4l2scalersrc.h"
 
@@ -462,6 +463,17 @@ done:
   return ret;
 }
 
+static void
+gst_v4l2_scaler_src_drain (GstV4l2ScalerSrc * v4l2scalersrc)
+{
+  /* FIXME: It could be removed once the videobuffer2 orphan buf is supported */
+  GstQuery *query = gst_query_new_drain ();
+  gst_query_set_drain (query, TRUE);
+  if (!gst_pad_peer_query (GST_BASE_SRC_PAD (v4l2scalersrc), query))
+    GST_DEBUG_OBJECT (v4l2scalersrc, "failed to query drain");
+  gst_query_unref (query);
+}
+
 static gboolean
 gst_v4l2_scaler_src_set_format (GstV4l2ScalerSrc * v4l2scalersrc,
     GstCaps * caps, GstV4l2Error * error)
@@ -469,6 +481,9 @@ gst_v4l2_scaler_src_set_format (GstV4l2ScalerSrc * v4l2scalersrc,
   GstV4l2Object *obj;
 
   obj = (GstV4l2Object *) v4l2scalersrc->v4l2scalerobject;
+
+  if (GST_V4L2_IS_ACTIVE (obj))
+    gst_v4l2_scaler_src_drain (v4l2scalersrc);
 
   /* make sure we stop capturing and dealloc buffers */
   if (!gst_v4l2_object_stop (obj))
@@ -1046,6 +1061,30 @@ gst_v4l2_scaler_src_change_state (GstElement * element,
 }
 
 static GstFlowReturn
+gst_v4l2_scaler_src_dqevent (GstV4l2BufferPool * pool)
+{
+  GstFlowReturn res = GST_FLOW_OK;
+  GstV4l2Object *obj = pool->obj;
+  struct v4l2_event evt;
+
+  memset (&evt, 0x00, sizeof (struct v4l2_event));
+  if (obj->ioctl (pool->video_fd, VIDIOC_DQEVENT, &evt) < 0) {
+    GST_WARNING_OBJECT (pool,
+        "Failed to dequeue an event on device '%s'.", obj->videodev);
+    res = GST_FLOW_ERROR;
+    goto done;
+  }
+
+  if (evt.type == V4L2_EVENT_SOURCE_CHANGE
+      && evt.u.src_change.changes == V4L2_EVENT_SRC_CH_RESOLUTION) {
+    res = obj->change_resolution (obj);
+  }
+
+done:
+  return res;
+}
+
+static GstFlowReturn
 gst_v4l2_scaler_src_create (GstPushSrc * src, GstBuffer ** buf)
 {
   GstV4l2ScalerSrc *v4l2scalersrc = gst_v4l2_scaler_src (src);
@@ -1056,8 +1095,27 @@ gst_v4l2_scaler_src_create (GstPushSrc * src, GstBuffer ** buf)
   GstClockTime abs_time, base_time, timestamp, duration;
   GstClockTime delay;
   GstMessage *qos_msg;
+  GstCaps *caps;
 
   do {
+    if (gst_poll_fd_has_pri (pool->poll, &pool->pollfd)) {
+      ret = gst_v4l2_scaler_src_dqevent (pool);
+
+      if (ret == GST_FLOW_ERROR)
+        goto dqevent_failed;
+
+      if (ret == GST_V4L2_FLOW_SOURCE_CHANGE) {
+        caps = gst_caps_new_simple ("video/x-raw",
+            "width", G_TYPE_INT, v4l2scalersrc->v4l2scalerobject->input_width,
+            "height", G_TYPE_INT, v4l2scalersrc->v4l2scalerobject->input_height,
+            NULL);
+        gst_caps_set_features (caps, 0,
+            gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_DMABUF, NULL));
+        g_object_set (v4l2scalersrc, "caps", caps, NULL);
+        gst_object_unref (caps);
+      }
+    }
+
     ret = GST_BASE_SRC_CLASS (parent_class)->alloc (GST_BASE_SRC (src), 0,
         obj->info.size, buf);
 
@@ -1224,6 +1282,10 @@ retry:
   return ret;
 
   /* ERROR */
+dqevent_failed:
+  {
+    return ret;
+  }
 alloc_failed:
   {
     if (ret != GST_FLOW_FLUSHING)

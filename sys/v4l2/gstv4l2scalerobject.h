@@ -39,6 +39,8 @@ struct _GstV4l2ScalerObject {
   gboolean scalable;
   GstCaps *destination_caps;
   gint vdo_fd;
+  guint input_width;
+  guint input_height;
 };
 
 struct _GstV4l2ScalerObjectClassHelper {
@@ -62,6 +64,9 @@ GstCaps*    gst_v4l2_scaler_object_get_caps        (GstV4l2ScalerObject * v4l2sc
 
 gboolean gst_v4l2_scaler_object_decide_allocation   (GstV4l2ScalerObject * v4l2scalerobject,
                                                      GstQuery * query);
+
+GstFlowReturn gst_v4l2_scaler_object_change_resolution (GstV4l2Object * v4l2object);
+
 G_END_DECLS
 
 #endif /* __GST_V4L2_SCALER_OBJECT_H__ */

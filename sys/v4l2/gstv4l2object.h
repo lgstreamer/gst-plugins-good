@@ -188,6 +188,9 @@ struct _GstV4l2Object {
   GstV4l2SetInOutFunction  set_in_out_func;
   GstV4l2UpdateFpsFunction update_fps_func;
 
+  /* virtual function */
+  GstFlowReturn (*change_resolution) (GstV4l2Object * v4l2object);
+
   /* syscalls */
   gint (*fd_open) (gint fd, gint v4l2_flags);
   gint (*close) (gint fd);
@@ -313,6 +316,10 @@ gboolean     gst_v4l2_get_input      (GstV4l2Object * v4l2object, gint * input);
 gboolean     gst_v4l2_set_input      (GstV4l2Object * v4l2object, gint input);
 gboolean     gst_v4l2_get_output     (GstV4l2Object * v4l2object, gint * output);
 gboolean     gst_v4l2_set_output     (GstV4l2Object * v4l2object, gint output);
+
+/* v4l2 event */
+gboolean gst_v4l2_subscribe_event (GstV4l2Object * v4l2object);
+gboolean gst_v4l2_unsubscribe_event (GstV4l2Object * v4l2object);
 
 /* frequency control */
 gboolean     gst_v4l2_get_frequency   (GstV4l2Object * v4l2object, gint tunernum, gulong * frequency);

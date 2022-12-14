@@ -256,6 +256,7 @@ struct _GstQTDemux {
   gboolean rpu_present_flag;
   gboolean el_present_flag;
   gboolean bl_present_flag;
+  gint8 dv_bl_signal_comp_id;
 #endif
 
 #ifdef MP4_PUSHMODE_TRICK

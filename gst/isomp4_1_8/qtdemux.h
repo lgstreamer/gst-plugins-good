@@ -118,7 +118,7 @@ struct _GstQTDemux
 #endif
 
   /* push based variables */
-  GstClockTime upstream_basetime; /* basetime given by upstream to be added to output pts */
+  GstClockTimeDiff upstream_basetime; /* basetime given by upstream to be added to output pts */
   GstClockTime upstream_basetime_offset; /* time offset derived by demux to be subtracted to output pts */
   gboolean new_collection;
   guint neededbytes;
@@ -234,6 +234,7 @@ struct _GstQTDemux
   guint32 dlna_opval;
 
   gint highest_temporal_id;
+  gint preselection_id;
 };
 
 struct _GstQTDemuxClass

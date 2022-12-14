@@ -28,6 +28,7 @@
 
 #include "gstv4l2scalerobject.h"
 #include "gst/gst-i18n-plugin.h"
+#include <linux/v4l2-ext/v4l2-controls-ext.h>
 
 GST_DEBUG_CATEGORY_EXTERN (v4l2_debug);
 #define GST_CAT_DEFAULT v4l2_debug
@@ -47,6 +48,10 @@ v4l2_mmap_wrapper (gpointer start, gsize length, gint prot, gint flags, gint fd,
 
 #endif /* SIZEOF_OFF_T < 8 */
 #endif /* HAVE_LIBV4L2 */
+
+#ifndef V4L2_CID_EXT_GPSCALER_INPUT_FRAME_SIZE
+#define V4L2_CID_EXT_GPSCALER_INPUT_FRAME_SIZE (V4L2_CID_USER_EXT_GPSCALER_BASE + 2)
+#endif
 
 GstV4l2ScalerObject *
 gst_v4l2_scaler_object_new (GstElement * element,
@@ -75,6 +80,8 @@ gst_v4l2_scaler_object_new (GstElement * element,
   v4l2object->get_in_out_func = get_in_out_func;
   v4l2object->set_in_out_func = set_in_out_func;
   v4l2object->update_fps_func = update_fps_func;
+
+  v4l2object->change_resolution = gst_v4l2_scaler_object_change_resolution;
 
   v4l2object->video_fd = -1;
   v4l2object->active = FALSE;
@@ -118,6 +125,8 @@ gst_v4l2_scaler_object_new (GstElement * element,
   v4l2scalerobject->scalable = TRUE;
   v4l2scalerobject->destination_caps = NULL;
   v4l2scalerobject->vdo_fd = -1;
+  v4l2scalerobject->input_width = 0;
+  v4l2scalerobject->input_height = 0;
 
   return v4l2scalerobject;
 }
@@ -583,4 +592,45 @@ no_downstream_pool:
         ("When importing DMABUF or USERPTR, we need a pool to import from"));
     return FALSE;
   }
+}
+
+GstFlowReturn
+gst_v4l2_scaler_object_change_resolution (GstV4l2Object * v4l2object)
+{
+  GstV4l2ScalerObject *v4l2scalerobject = (GstV4l2ScalerObject *)v4l2object;
+  struct v4l2_control control;
+  guint16 width, height;
+
+  control.id = V4L2_CID_EXT_GPSCALER_INPUT_FRAME_SIZE;
+  if (v4l2object->ioctl (v4l2object->video_fd, VIDIOC_G_CTRL, &control) < 0) {
+    GST_WARNING_OBJECT (v4l2object->dbg_obj,
+        "Failed to get value for control %d on device '%s'.",
+        control.id, v4l2object->videodev);
+    return GST_FLOW_ERROR;
+  }
+
+  width = (control.value >> 16) & 0xffff;
+  height = control.value & 0xffff;
+
+  if (width > v4l2scalerobject->max_width) {
+    height = height * v4l2scalerobject->max_width / width;
+    width = v4l2scalerobject->max_width;
+  }
+  if (height > v4l2scalerobject->max_height) {
+    width = width * v4l2scalerobject->max_height / height;
+    height = v4l2scalerobject->max_height;
+  }
+
+  if ((v4l2scalerobject->input_width == width) && (v4l2scalerobject->input_height == height)) {
+    GST_DEBUG_OBJECT (v4l2object->dbg_obj, "No change resolution");
+    return GST_FLOW_OK;
+  }
+
+  GST_DEBUG_OBJECT (v4l2object->dbg_obj, "Change resolution %dx%d to %dx%d",
+      v4l2scalerobject->input_width, v4l2scalerobject->input_height,
+      width, height);
+  v4l2scalerobject->input_width = width;
+  v4l2scalerobject->input_height = height;
+
+  return GST_V4L2_FLOW_SOURCE_CHANGE;
 }

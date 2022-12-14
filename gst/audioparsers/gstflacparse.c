@@ -1102,6 +1102,7 @@ error:
   return FALSE;
 }
 
+#if 0
 static gboolean
 gst_flac_parse_handle_picture (GstFlacParse * flacparse, GstBuffer * buffer)
 {
@@ -1156,6 +1157,7 @@ error:
   gst_buffer_unmap (buffer, &map);
   return FALSE;
 }
+#endif
 
 static gboolean
 gst_flac_parse_handle_seektable (GstFlacParse * flacparse, GstBuffer * buffer)
@@ -1527,11 +1529,13 @@ gst_flac_parse_handle_block_type (GstFlacParse * flacparse, guint type,
       GST_INFO_OBJECT (flacparse, "CUESHEET header");
       ret = gst_flac_parse_handle_cuesheet (flacparse, sbuffer);
       break;
+#if 0
     case 6:                    /* PICTURE */
       GST_INFO_OBJECT (flacparse, "PICTURE header");
       ret = gst_flac_parse_handle_picture (flacparse, sbuffer);
       ret = FALSE;
       break;
+#endif
     case 1:                    /* PADDING */
       GST_INFO_OBJECT (flacparse, "PADDING header");
       ret = FALSE;

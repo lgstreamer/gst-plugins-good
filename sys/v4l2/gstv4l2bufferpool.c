@@ -1597,8 +1597,10 @@ gst_v4l2_buffer_pool_new (GstV4l2Object * obj, GstCaps * caps)
   gst_poll_add_fd (pool->poll, &pool->pollfd);
   if (V4L2_TYPE_IS_OUTPUT (obj->type))
     gst_poll_fd_ctl_write (pool->poll, &pool->pollfd, TRUE);
-  else
+  else {
     gst_poll_fd_ctl_read (pool->poll, &pool->pollfd, TRUE);
+    gst_poll_fd_ctl_pri (pool->poll, &pool->pollfd, TRUE);
+  }
 
   pool->video_fd = fd;
   pool->obj = obj;

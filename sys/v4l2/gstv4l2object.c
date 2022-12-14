@@ -497,6 +497,8 @@ gst_v4l2_object_new (GstElement * element,
   v4l2object->set_in_out_func = set_in_out_func;
   v4l2object->update_fps_func = update_fps_func;
 
+  v4l2object->change_resolution = NULL;
+
   v4l2object->video_fd = -1;
   v4l2object->active = FALSE;
   v4l2object->videodev = g_strdup (default_device);
@@ -927,7 +929,7 @@ gst_v4l2_object_close (GstV4l2Object * v4l2object)
     g_free (v4l2object->par);
     v4l2object->par = NULL;
   }
-  
+
   if (v4l2object->channel) {
     g_free (v4l2object->channel);
     v4l2object->channel = NULL;
