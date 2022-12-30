@@ -1,7 +1,7 @@
 #!/bin/sh
 # Copyright (c) 2019  LG Electronics, Inc.
 
-arm_libtool=`find -name "arm-*gnueabi-libtool"`
+arm_libtool=`find -name "libtool"`
 echo "Found ${arm_libtool}"
 
 line=`grep -n "func_resolve_sysroot_result=\$\lt_sysroot\$\func_stripname_result" ./${arm_libtool} | cut -d':' -f1`
@@ -11,7 +11,7 @@ my_ltsysroot="if [[ "\$func_stripname_result" =~ "\$lt_sysroot" ]]; then func_re
 if [ "${line}+99999" = "+99999" ]; then
   echo "Nothing to do for ${arm_libtool}"
 else
-  sed -i "${line}s/.*/${my_ltsysroot}/g" ./arm-starfishmllib32-linux-gnueabi-libtool
+  sed -i "${line}s/.*/${my_ltsysroot}/g" ${arm_libtool}
   echo "Updated sysroot in ${arm_libtool}"
 fi
 
