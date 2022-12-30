@@ -7171,6 +7171,9 @@ gst_matroska_demux_audio_caps (GstMatroskaTrackAudioContext *
           strlen (GST_MATROSKA_CODEC_ID_AUDIO_TRUEHD))) {
     caps = gst_caps_new_empty_simple ("audio/x-true-hd");
     *codec_name = g_strdup ("Dolby TrueHD");
+  } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_DTS)) {
+    caps = gst_caps_new_empty_simple ("audio/x-dts");
+    *codec_name = g_strdup ("DTS audio");
   } else if (!strcmp (codec_id, GST_MATROSKA_CODEC_ID_AUDIO_VORBIS)) {
     caps = gst_caps_new_empty_simple ("audio/x-vorbis");
     context->stream_headers =
