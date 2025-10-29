@@ -15529,6 +15529,11 @@ gst_qtdemux_handle_esds (GstQTDemux * qtdemux, QtDemuxStream * stream,
       caps = gst_caps_new_simple ("audio/x-ac3",
           "framed", G_TYPE_BOOLEAN, TRUE, NULL);
       break;
+    case 0xA9:                 /* DTS */
+      codec_name = "DTS audio";
+      caps = gst_caps_new_simple ("audio/x-dts",
+          "framed", G_TYPE_BOOLEAN, TRUE, NULL);
+      break;
     case 0xE1:                 /* QCELP */
       /* QCELP, the codec_data is a riff tag (little endian) with
        * more info (http://ftp.3gpp2.org/TSGC/Working/2003/2003-05-SanDiego/TSG-C-2003-05-San%20Diego/WG1/SWG12/C12-20030512-006%20=%20C12-20030217-015_Draft_Baseline%20Text%20of%20FFMS_R2.doc). */
@@ -16176,6 +16181,42 @@ qtdemux_audio_caps (GstQTDemux * qtdemux, QtDemuxStream * stream,
       caps = gst_caps_new_simple ("audio/x-ac4",
           "framed", G_TYPE_BOOLEAN, TRUE, "frame-format", G_TYPE_STRING, "RAW",
           NULL);
+      stream->sampled = TRUE;
+      break;
+    case GST_MAKE_FOURCC ('d', 't', 's', 'c'):
+    case GST_MAKE_FOURCC ('D', 'T', 'S', 'C'):
+    case GST_MAKE_FOURCC ('D', 'T', 'S', ' '):
+      _codec ("DTS audio");
+      caps = gst_caps_new_simple ("audio/x-dts",
+          "framed", G_TYPE_BOOLEAN, TRUE, NULL);
+      stream->sampled = TRUE;
+      break;
+      /* add caps information for DTS M6 certification */
+    case GST_MAKE_FOURCC ('d', 't', 's', 'h'): // DTS-HD
+    case GST_MAKE_FOURCC ('D', 'T', 'S', 'H'):
+      _codec ("dtsh");
+      caps = gst_caps_new_simple ("audio/x-dtsh",
+          "framed", G_TYPE_BOOLEAN, TRUE, NULL);
+      stream->sampled = TRUE;
+      break;
+    case GST_MAKE_FOURCC ('d', 't', 's', 'l'): // DTS-HD Lossless
+    case GST_MAKE_FOURCC ('D', 'T', 'S', 'L'):
+      _codec ("dtsl");
+      caps = gst_caps_new_simple ("audio/x-dtsl",
+          "framed", G_TYPE_BOOLEAN, TRUE, NULL);
+      stream->sampled = TRUE;
+      break;
+    case GST_MAKE_FOURCC ('d', 't', 's', 'e'):
+    case GST_MAKE_FOURCC ('D', 'T', 'S', 'E'):
+      _codec ("dtse");
+      caps = gst_caps_new_simple ("audio/x-dtse",
+          "framed", G_TYPE_BOOLEAN, TRUE, NULL);
+      stream->sampled = TRUE;
+      break;
+    case FOURCC_dtsx:
+      _codec ("dtsx");
+      caps = gst_caps_new_simple ("audio/x-dtsx",
+          "framed", G_TYPE_BOOLEAN, TRUE, NULL);
       stream->sampled = TRUE;
       break;
     case FOURCC_MAC3:

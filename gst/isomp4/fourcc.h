@@ -410,6 +410,9 @@ G_BEGIN_DECLS
 /* MPEG-H 3D Audio stream(MHAS) */
 #define FOURCC_mhm1     GST_MAKE_FOURCC('m','h','m','1')
 
+/* DTS UHD stream */
+#define FOURCC_dtsx     GST_MAKE_FOURCC('d','t','s','x')
+
 G_END_DECLS
 
 #endif /* __FOURCC_H__ */

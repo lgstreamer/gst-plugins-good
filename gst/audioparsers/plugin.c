@@ -25,6 +25,7 @@
 #include "gstamrparse.h"
 #include "gstac3parse.h"
 #include "gstac4parse.h"
+#include "gstdcaparse.h"
 #include "gstflacparse.h"
 #include "gstmpegaudioparse.h"
 #include "gstsbcparse.h"
@@ -43,6 +44,8 @@ plugin_init (GstPlugin * plugin)
       GST_RANK_PRIMARY + 1, GST_TYPE_AC3_PARSE);
   ret &= gst_element_register (plugin, "ac4parse",
       GST_RANK_PRIMARY + 1, GST_TYPE_AC4_PARSE);
+  ret &= gst_element_register (plugin, "dcaparse",
+      GST_RANK_PRIMARY + 1, GST_TYPE_DCA_PARSE);
   ret &= gst_element_register (plugin, "flacparse",
       GST_RANK_PRIMARY + 1, GST_TYPE_FLAC_PARSE);
   ret &= gst_element_register (plugin, "mpegaudioparse",

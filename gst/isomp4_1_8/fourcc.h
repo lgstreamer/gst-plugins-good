@@ -393,6 +393,9 @@ G_BEGIN_DECLS
 
 #define FOURCC_stpp     GST_MAKE_FOURCC('s','t','p','p')
 
+/* DTS UHD stream */
+#define FOURCC_dtsx     GST_MAKE_FOURCC('d','t','s','x')
+
 G_END_DECLS
 
 #endif /* __FOURCC_H__ */
