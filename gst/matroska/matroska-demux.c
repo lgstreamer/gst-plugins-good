@@ -8070,11 +8070,10 @@ matroska_demux_prepare_dolby_track (GstMatroskaDemux * demux,
       }
     } else if (demux->dv_profile > 7) {
       if (demux->dv_box_conf != DVVC) {
-        GST_ELEMENT_ERROR (demux, STREAM, DEMUX,
-            (("This file has wrong file format.")),
-            ("Profile [%d] and Box Configuration [%d] does not match.",
-                demux->dv_profile, demux->dv_box_conf));
-        return FALSE;
+        GST_WARNING_OBJECT (demux,
+          "Dolby Vision profile %d with box config %d is not supported, but should play as HDR.",
+          demux->dv_profile, demux->dv_box_conf);
+        return TRUE;
       }
     } else {
       GST_ELEMENT_ERROR (demux, STREAM, DEMUX,
