@@ -182,6 +182,14 @@ static gboolean perform_seek_to_offset (GstMatroskaDemux * demux,
 static gboolean perform_seek_to_keyframe_offset (GstMatroskaDemux *
     demux, gdouble rate, guint64 offset);
 
+#ifdef DOLBYHDR_SUPPORT
+/* Dolby Vision functions */
+static gboolean
+gst_matroska_demux_check_dolby_vision_compatibility (GstMatroskaDemux * demux);
+static gboolean matroska_demux_prepare_dolby_track (GstMatroskaDemux * demux,
+    GstMatroskaTrackContext * context);
+#endif
+
 GType gst_matroska_demux_get_type (void);
 #define parent_class gst_matroska_demux_parent_class
 G_DEFINE_TYPE (GstMatroskaDemux, gst_matroska_demux, GST_TYPE_ELEMENT);
@@ -259,6 +267,9 @@ gst_matroska_demux_init (GstMatroskaDemux * demux)
 
   demux->flowcombiner = gst_flow_combiner_new ();
   demux->thumbnail_mode = FALSE;
+#ifdef DOLBYHDR_SUPPORT
+  demux->dolby_vision_support = FALSE;
+#endif
 
   /* finish off */
   gst_matroska_demux_reset (GST_ELEMENT (demux));
@@ -338,6 +349,19 @@ gst_matroska_demux_reset (GstElement * element)
   demux->scan_next_cluster_push = FALSE;
   demux->is_flushing = FALSE;
   gst_flow_combiner_clear (demux->flowcombiner);
+
+#ifdef DOLBYHDR_SUPPORT
+  /* Initialize Dolby HDR variables */
+  demux->is_dolby_hdr = FALSE;
+  demux->has_dolby_bl_cand = FALSE;
+  demux->has_dolby_el_cand = FALSE;
+
+  demux->dv_profile = -1;
+  demux->rpu_present_flag = FALSE;
+  demux->el_present_flag = FALSE;
+  demux->bl_present_flag = FALSE;
+  demux->dv_bl_signal_comp_id = -1;
+#endif
 }
 
 static GstBuffer *
@@ -396,6 +420,100 @@ gst_matroska_demux_add_stream_headers_to_caps (GstMatroskaDemux * demux,
 }
 
 #if 0
+static GstFlowReturn
+gst_matroska_demux_parse_mastering_metadata (GstMatroskaDemux * demux,
+    GstEbmlRead * ebml, GstMatroskaTrackVideoContext * video_context)
+{
+  GstFlowReturn ret = GST_FLOW_OK;
+  GstVideoMasteringDisplayInfo minfo;
+  guint32 id;
+  gdouble num;
+  /* Precision defined by HEVC specification */
+  const guint chroma_scale = 50000;
+  const guint luma_scale = 10000;
+
+  gst_video_mastering_display_info_init (&minfo);
+
+  DEBUG_ELEMENT_START (demux, ebml, "MasteringMetadata");
+
+  if ((ret = gst_ebml_read_master (ebml, &id)) != GST_FLOW_OK)
+    goto beach;
+
+  while (ret == GST_FLOW_OK && gst_ebml_read_has_remaining (ebml, 1, TRUE)) {
+    if ((ret = gst_ebml_peek_id (ebml, &id)) != GST_FLOW_OK)
+      goto beach;
+
+    /* all sub elements have float type */
+    if ((ret = gst_ebml_read_float (ebml, &id, &num)) != GST_FLOW_OK)
+      goto beach;
+
+    /* chromaticity should be in [0, 1] range */
+    if (id >= GST_MATROSKA_ID_PRIMARYRCHROMATICITYX &&
+        id <= GST_MATROSKA_ID_WHITEPOINTCHROMATICITYY) {
+      if (num < 0 || num > 1.0) {
+        GST_WARNING_OBJECT (demux, "0x%x has invalid value %f", id, num);
+        goto beach;
+      }
+    } else if (id == GST_MATROSKA_ID_LUMINANCEMAX ||
+        id == GST_MATROSKA_ID_LUMINANCEMIN) {
+      /* Note: webM spec said valid range is [0, 999.9999] but
+       * 1000 cd/m^2 is generally used value on HDR. Just check guint range here.
+       * See https://www.webmproject.org/docs/container/#LuminanceMax
+       */
+      if (num < 0 || num > (gdouble) (G_MAXUINT32 / luma_scale)) {
+        GST_WARNING_OBJECT (demux, "0x%x has invalid value %f", id, num);
+        goto beach;
+      }
+    }
+
+    switch (id) {
+      case GST_MATROSKA_ID_PRIMARYRCHROMATICITYX:
+        minfo.display_primaries[0].x = (guint16) (num * chroma_scale);
+        break;
+      case GST_MATROSKA_ID_PRIMARYRCHROMATICITYY:
+        minfo.display_primaries[0].y = (guint16) (num * chroma_scale);
+        break;
+      case GST_MATROSKA_ID_PRIMARYGCHROMATICITYX:
+        minfo.display_primaries[1].x = (guint16) (num * chroma_scale);
+        break;
+      case GST_MATROSKA_ID_PRIMARYGCHROMATICITYY:
+        minfo.display_primaries[1].y = (guint16) (num * chroma_scale);
+        break;
+      case GST_MATROSKA_ID_PRIMARYBCHROMATICITYX:
+        minfo.display_primaries[2].x = (guint16) (num * chroma_scale);
+        break;
+      case GST_MATROSKA_ID_PRIMARYBCHROMATICITYY:
+        minfo.display_primaries[2].y = (guint16) (num * chroma_scale);
+        break;
+      case GST_MATROSKA_ID_WHITEPOINTCHROMATICITYX:
+        minfo.white_point.x = (guint16) (num * chroma_scale);
+        break;
+      case GST_MATROSKA_ID_WHITEPOINTCHROMATICITYY:
+        minfo.white_point.y = (guint16) (num * chroma_scale);
+        break;
+      case GST_MATROSKA_ID_LUMINANCEMAX:
+        minfo.max_display_mastering_luminance = (guint32) (num * luma_scale);
+        break;
+      case GST_MATROSKA_ID_LUMINANCEMIN:
+        minfo.min_display_mastering_luminance = (guint32) (num * luma_scale);
+        break;
+      default:
+        GST_FIXME_OBJECT (demux,
+            "Unsupported subelement 0x%x in MasteringMetadata", id);
+        ret = gst_ebml_read_skip (ebml);
+        break;
+    }
+  }
+
+  video_context->mastering_display_info = minfo;
+  video_context->mastering_display_info_present = TRUE;
+
+beach:
+  DEBUG_ELEMENT_STOP (demux, ebml, "MasteringMetadata", ret);
+
+  return ret;
+}
+
 static GstFlowReturn
 gst_matroska_demux_parse_colour (GstMatroskaDemux * demux, GstEbmlRead * ebml,
     GstMatroskaTrackVideoContext * video_context)
@@ -560,6 +678,39 @@ gst_matroska_demux_parse_colour (GstMatroskaDemux * demux, GstEbmlRead * ebml,
             GST_FIXME_OBJECT (demux, "Unsupported color primaries  %"
                 G_GUINT64_FORMAT, num);
             break;
+        }
+        break;
+      }
+
+      case GST_MATROSKA_ID_MASTERINGMETADATA:{
+        if ((ret =
+                gst_matroska_demux_parse_mastering_metadata (demux, ebml,
+                    video_context)) != GST_FLOW_OK)
+          goto beach;
+        break;
+      }
+
+      case GST_MATROSKA_ID_MAXCLL:{
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          goto beach;
+        if (num > G_MAXUINT16) {
+          GST_WARNING_OBJECT (demux,
+              "Too large maxCLL value %" G_GUINT64_FORMAT, num);
+        } else {
+          video_context->content_light_level.max_content_light_level = num;
+        }
+        break;
+      }
+
+      case GST_MATROSKA_ID_MAXFALL:{
+        if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+          goto beach;
+        if (num >= G_MAXUINT16) {
+          GST_WARNING_OBJECT (demux,
+              "Too large maxFALL value %" G_GUINT64_FORMAT, num);
+        } else {
+          video_context->content_light_level.max_frame_average_light_level =
+              num;
         }
         break;
       }
@@ -1050,11 +1201,8 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
         if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
           break;
 
-        if (num == 0) {
-          GST_ERROR_OBJECT (demux, "Invalid TrackUID 0");
-          ret = GST_FLOW_ERROR;
-          break;
-        }
+        if (num == 0)
+          GST_WARNING_OBJECT (demux, "Invalid TrackUID 0");
 
         GST_DEBUG_OBJECT (demux, "TrackUID: %" G_GUINT64_FORMAT, num);
         context->uid = num;
@@ -1698,6 +1846,108 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
         break;
       }
 
+/* Retrieve Dolby Vision config data from BlockAdditionMapping element */
+#ifdef DOLBYHDR_SUPPORT
+      case GST_MATROSKA_ID_BLOCKADDITIONMAPPING:{
+        if ((ret = gst_ebml_read_master (ebml, &id)) != GST_FLOW_OK) {
+          break;
+        }
+
+        while (ret == GST_FLOW_OK
+            && gst_ebml_read_has_remaining (ebml, 1, TRUE)) {
+          if ((ret = gst_ebml_peek_id (ebml, &id)) != GST_FLOW_OK) {
+            break;
+          }
+
+          switch (id) {
+            case GST_MATROSKA_ID_BLOCKADDIDVALUE:{
+              guint64 num;
+              if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+                break;
+              GST_DEBUG_OBJECT (demux,
+                  "BlockAdditionMapping BlockAddIDValue: %" G_GUINT64_FORMAT,
+                  num);
+              break;
+            }
+
+              /* Recognize DV by name */
+            case GST_MATROSKA_ID_BLOCKADDIDNAME:{
+              gchar *text;
+              if ((ret = gst_ebml_read_ascii (ebml, &id, &text)) != GST_FLOW_OK) {
+                break;
+              }
+
+              GST_DEBUG_OBJECT (demux,
+                  "BlockAdditionMapping BlockAddIDName: %s",
+                  GST_STR_NULL (text));
+              if (g_strcmp0 (text, "Dolby Vision configuration") == 0) {
+                demux->is_dolby_hdr = TRUE;
+              }
+              g_free (text);
+              break;
+            }
+
+              /* Recognize DV by identifier number */
+            case GST_MATROSKA_ID_BLOCKADDIDTYPE:{
+              guint64 num;
+              if ((ret = gst_ebml_read_uint (ebml, &id, &num)) != GST_FLOW_OK)
+                break;
+
+              GST_DEBUG_OBJECT (demux,
+                  "BlockAdditionMapping BlockAddIDType: %" G_GUINT64_FORMAT,
+                  num);
+
+              /* dvcC, profile 7 <= (equal to or less than 7) */
+              if (num == 1685480259) {
+                demux->is_dolby_hdr = TRUE;
+                demux->dv_box_conf = DVCC;
+              }
+              /* dvvC, profile 7 > (greater than 7) */
+              else if (num == 1685485123) {
+                demux->is_dolby_hdr = TRUE;
+                demux->dv_box_conf = DVVC;
+              }
+              break;
+            }
+
+              /* Parse DOVIDecoderConfigurationData */
+            case GST_MATROSKA_ID_BLOCKADDIDEXTRADATA:{
+              guint8 *data;
+              guint64 size;
+
+              if ((ret =
+                      gst_ebml_read_binary (ebml, &id, &data,
+                          &size)) != GST_FLOW_OK)
+                break;
+
+              demux->dv_profile = (data[2] >> 1) & 0x7f;
+              demux->rpu_present_flag = (data[3] >> 2) & 0x01;
+              demux->el_present_flag = (data[3] >> 1) & 0x01;
+              demux->bl_present_flag = (data[3]) & 0x01;
+              demux->dv_bl_signal_comp_id = (data[4] >> 4) & 0x0f;
+
+              /* Debug extracted values for Dolby Vision */
+              GST_DEBUG_OBJECT (demux,
+                  "dv_box_conf = %d, dv_profile = %d, rpu_present_flag = %d, "
+                  "el_present_flag = %d, bl_present_flag = %d, dv_bl_signal_comp_id = %d",
+                  demux->dv_box_conf, demux->dv_profile,
+                  demux->rpu_present_flag, demux->el_present_flag,
+                  demux->bl_present_flag, demux->dv_bl_signal_comp_id);
+              break;
+            }
+
+            default:{
+              ret =
+                  gst_matroska_read_common_parse_skip (&demux->common, ebml,
+                  "BlockAdditionMapping", id);
+              break;
+            }
+          }
+        }
+        break;
+      }
+#endif
+
       default:
         GST_WARNING ("Unknown TrackEntry subelement 0x%x - ignoring", id);
         /* pass-through */
@@ -1888,6 +2138,16 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
   }
 
   context->caps = caps;
+
+  /* Prepare Dolby HDR related src caps */
+#ifdef DOLBYHDR_SUPPORT
+  GST_DEBUG_OBJECT (demux, "is_dolby_hdr = %d", demux->is_dolby_hdr);
+  if (demux->is_dolby_hdr) {
+    if (!matroska_demux_prepare_dolby_track (demux, context)) {
+      GST_DEBUG_OBJECT (demux, "Fail to define dolby HDR stream configure");
+    }
+  }
+#endif
 
   /* tadaah! */
   *dest_context = context;
@@ -4522,6 +4782,104 @@ gst_matroska_demux_align_buffer (GstMatroskaDemux * demux,
   return buffer;
 }
 
+typedef struct
+{
+  guint8 *data;
+  gsize size;
+  guint64 id;
+} BlockAddition;
+
+static GstFlowReturn
+gst_matroska_demux_parse_blockmore (GstMatroskaDemux * demux,
+    GstEbmlRead * ebml, GQueue * additions)
+{
+  GstFlowReturn ret;
+  guint32 id;
+  guint64 block_id = 1;
+  guint64 datalen = 0;
+  guint8 *data = NULL;
+
+  ret = gst_ebml_read_master (ebml, &id);       /* GST_MATROSKA_ID_BLOCKMORE */
+  if (ret != GST_FLOW_OK)
+    return ret;
+
+  /* read all BlockMore sub-entries */
+  while (ret == GST_FLOW_OK && gst_ebml_read_has_remaining (ebml, 1, TRUE)) {
+
+    if ((ret = gst_ebml_peek_id (ebml, &id)) != GST_FLOW_OK)
+      break;
+
+    switch (id) {
+      case GST_MATROSKA_ID_BLOCKADDID:
+        ret = gst_ebml_read_uint (ebml, &id, &block_id);
+        if (block_id == 0)
+          block_id = 1;
+        break;
+      case GST_MATROSKA_ID_BLOCKADDITIONAL:
+        g_free (data);
+        data = NULL;
+        datalen = 0;
+        ret = gst_ebml_read_binary (ebml, &id, &data, &datalen);
+        break;
+      default:
+        ret = gst_matroska_read_common_parse_skip (&demux->common, ebml,
+            "BlockMore", id);
+        break;
+    }
+  }
+
+  if (data != NULL && datalen > 0) {
+    BlockAddition *blockadd = g_new (BlockAddition, 1);
+
+    GST_LOG_OBJECT (demux, "BlockAddition %" G_GUINT64_FORMAT ": "
+        "%" G_GUINT64_FORMAT " bytes", block_id, datalen);
+    GST_MEMDUMP_OBJECT (demux, "BlockAdditional", data, datalen);
+    blockadd->data = data;
+    blockadd->size = datalen;
+    blockadd->id = block_id;
+    g_queue_push_tail (additions, blockadd);
+    GST_LOG_OBJECT (demux, "now %d pending block additions", additions->length);
+  }
+
+  return ret;
+}
+
+/* BLOCKADDITIONS
+ *  BLOCKMORE
+ *    BLOCKADDID
+ *    BLOCKADDITIONAL
+ */
+static GstFlowReturn
+gst_matroska_demux_parse_blockadditions (GstMatroskaDemux * demux,
+    GstEbmlRead * ebml, GQueue * additions)
+{
+  GstFlowReturn ret;
+  guint32 id;
+
+  ret = gst_ebml_read_master (ebml, &id);       /* GST_MATROSKA_ID_BLOCKADDITIONS */
+  if (ret != GST_FLOW_OK)
+    return ret;
+
+  /* read all BlockMore sub-entries */
+  while (ret == GST_FLOW_OK && gst_ebml_read_has_remaining (ebml, 1, TRUE)) {
+
+    if ((ret = gst_ebml_peek_id (ebml, &id)) != GST_FLOW_OK)
+      break;
+
+    if (id == GST_MATROSKA_ID_BLOCKMORE) {
+      DEBUG_ELEMENT_START (demux, ebml, "BlockMore");
+      ret = gst_matroska_demux_parse_blockmore (demux, ebml, additions);
+      DEBUG_ELEMENT_STOP (demux, ebml, "BlockMore", ret);
+      if (ret != GST_FLOW_OK)
+        break;
+    } else {
+      GST_WARNING_OBJECT (demux, "Expected BlockMore, got %x", id);
+    }
+  }
+
+  return ret;
+}
+
 static GstFlowReturn
 gst_matroska_demux_parse_blockgroup_or_simpleblock (GstMatroskaDemux * demux,
     GstEbmlRead * ebml, guint64 cluster_time, guint64 cluster_offset,
@@ -4543,6 +4901,7 @@ gst_matroska_demux_parse_blockgroup_or_simpleblock (GstMatroskaDemux * demux,
   gint64 referenceblock = 0;
   gint64 offset;
   GstClockTime buffer_timestamp;
+  GQueue additions = G_QUEUE_INIT;
 
   offset = gst_ebml_read_get_offset (ebml);
 
@@ -4690,6 +5049,14 @@ gst_matroska_demux_parse_blockgroup_or_simpleblock (GstMatroskaDemux * demux,
         break;
       }
 
+      case GST_MATROSKA_ID_BLOCKADDITIONS:
+      {
+        DEBUG_ELEMENT_START (demux, ebml, "BlockAdditions");
+        ret = gst_matroska_demux_parse_blockadditions (demux, ebml, &additions);
+        DEBUG_ELEMENT_STOP (demux, ebml, "BlockAdditions", ret);
+        break;
+      }
+
       case GST_MATROSKA_ID_BLOCKDURATION:{
         ret = gst_ebml_read_uint (ebml, &id, &block_duration);
         GST_DEBUG_OBJECT (demux, "BlockDuration: %" G_GUINT64_FORMAT,
@@ -4751,7 +5118,6 @@ gst_matroska_demux_parse_blockgroup_or_simpleblock (GstMatroskaDemux * demux,
         break;
 
       case GST_MATROSKA_ID_BLOCKVIRTUAL:
-      case GST_MATROSKA_ID_BLOCKADDITIONS:
       case GST_MATROSKA_ID_REFERENCEPRIORITY:
       case GST_MATROSKA_ID_REFERENCEVIRTUAL:
       case GST_MATROSKA_ID_SLICES:
@@ -5218,7 +5584,14 @@ done:
     gst_buffer_unref (buf);
   }
   g_free (lace_size);
+  {
+    BlockAddition *blockadd;
 
+    while ((blockadd = g_queue_pop_head (&additions))) {
+      g_free (blockadd->data);
+      g_free (blockadd);
+    }
+  }
   return ret;
 
   /* EXITS */
@@ -5464,7 +5837,7 @@ gst_matroska_demux_parse_contents (GstMatroskaDemux * demux, GstEbmlRead * ebml)
 
 #define GST_FLOW_OVERFLOW   GST_FLOW_CUSTOM_ERROR
 
-#define MAX_BLOCK_SIZE (15 * 1024 * 1024)
+#define MAX_BLOCK_SIZE (50 * 1024 * 1024)
 
 static inline GstFlowReturn
 gst_matroska_demux_check_read_size (GstMatroskaDemux * demux, guint64 bytes)
@@ -5735,6 +6108,7 @@ gst_matroska_demux_parse_id (GstMatroskaDemux * demux, guint32 id,
       break;
     case GST_MATROSKA_READ_STATE_SCANNING:
       if (id != GST_MATROSKA_ID_CLUSTER &&
+          id != GST_MATROSKA_ID_PREVSIZE &&
           id != GST_MATROSKA_ID_CLUSTERTIMECODE) {
         if (demux->common.start_resync_offset != -1) {
           /* we need to skip byte per byte if we are scanning for a new cluster
@@ -5812,6 +6186,8 @@ gst_matroska_demux_parse_id (GstMatroskaDemux * demux, guint32 id,
                 GST_DEBUG_OBJECT (demux,
                     "estimated duration as %" GST_TIME_FORMAT,
                     GST_TIME_ARGS (demux->common.segment.duration));
+
+                g_free (last);
               }
             }
 
@@ -7538,13 +7914,20 @@ gst_matroska_demux_change_state (GstElement * element,
   switch (transition) {
     case GST_STATE_CHANGE_NULL_TO_READY:
       property_ret = gst_element_get_smart_properties (GST_ELEMENT_CAST (demux),
+#ifdef DOLBYHDR_SUPPORT
+          "dolby-vision-support", &demux->dolby_vision_support,
+#endif
           "thumbnail-mode", &demux->thumbnail_mode, "max-gap-time",
           &demux->max_gap_time, NULL);
 
       if (property_ret != GST_SMART_PROPERTIES_OK) {
-        GST_WARNING_OBJECT (demux, "faield to get properties");
+        GST_WARNING_OBJECT (demux, "failed to get properties");
       }
 
+#ifdef DOLBYHDR_SUPPORT
+      GST_INFO_OBJECT (demux, "dolby-vision-support = %d",
+          demux->dolby_vision_support);
+#endif
       GST_INFO_OBJECT (demux, "thumbnail-mode = %d", demux->thumbnail_mode);
       GST_INFO_OBJECT (demux, "max-gap-time = %" G_GUINT64_FORMAT,
           demux->max_gap_time);
@@ -7567,6 +7950,161 @@ gst_matroska_demux_change_state (GstElement * element,
 
   return ret;
 }
+
+/* Check and set Dolby Vision */
+#ifdef DOLBYHDR_SUPPORT
+static gboolean
+gst_matroska_demux_check_dolby_vision_compatibility (GstMatroskaDemux * demux)
+{
+  gboolean res = FALSE;
+
+  /* BL signal cross-compatibility ID
+   * 0: None
+   * 1: HDR10
+   * 2: SDR
+   * 4: HLG
+   * 6: UHD Blu-ray Disc HDR */
+
+  switch (demux->dv_profile) {
+    case 4:
+      if (demux->dv_bl_signal_comp_id == 0 || demux->dv_bl_signal_comp_id == 2)
+        res = TRUE;
+      break;
+    case 7:
+      if (demux->dv_bl_signal_comp_id == 6)
+        res = TRUE;
+      break;
+    case 8:
+      if (demux->dv_bl_signal_comp_id == 1 || demux->dv_bl_signal_comp_id == 2
+          || demux->dv_bl_signal_comp_id == 4)
+        res = TRUE;
+      break;
+    case 9:
+      if (demux->dv_bl_signal_comp_id == 2)
+        res = TRUE;
+      break;
+    case 10:
+      if (demux->dv_bl_signal_comp_id == 1 || demux->dv_bl_signal_comp_id == 2
+          || demux->dv_bl_signal_comp_id == 4)
+        res = TRUE;
+      break;
+    default:
+      break;
+  }
+
+  return res;
+}
+
+/* LG Supported Dolby Vision profile
+  * 4.0 (SDR compatible)
+  * 4.2 (SDR compatible)
+  * 5.0 (none)
+  * 7.6 (UHD Blu-ray Disc HDR compatible)
+  * 8.1 (HDR10 compatible)
+  * 8.2 (SDR compatible)
+  * 8.4 (HLG compatible)
+  * 9.2 (SDR compatible)
+  * 10.0 (none)
+  * 10.1 (HDR10 compatible)
+  * 10.2 (SDR compatible)
+  * 10.4 (HLG compatible) */
+static gboolean
+matroska_demux_prepare_dolby_track (GstMatroskaDemux * demux,
+    GstMatroskaTrackContext * context)
+{
+  g_return_val_if_fail (context != NULL, FALSE);
+  g_return_val_if_fail (demux->is_dolby_hdr, FALSE);
+
+  GST_DEBUG_OBJECT (demux, "prepare dolby track");
+
+  if (demux->dv_box_conf == OTHER) {
+    GST_ELEMENT_ERROR (demux, STREAM, DEMUX,
+        (("This file contains no playable streams.")),
+        ("This Box Configuration [%d] of DolbyVision is not supported.",
+            demux->dv_box_conf));
+    return FALSE;
+  }
+
+  GST_DEBUG_OBJECT (demux, "dolby_vision_support from prepare_dolby = %d",
+      demux->dolby_vision_support);
+
+  /* If the platform does not support Dolby Vision,
+   * check if the stream can play with backward compatibility.
+   * If not, the stream cannot be played.
+   */
+  if (!demux->dolby_vision_support) {
+    if (!gst_matroska_demux_check_dolby_vision_compatibility (demux)) {
+      GST_ELEMENT_ERROR (demux, STREAM, DEMUX,
+          (("This file contains no playable streams.")),
+          ("This profileID [%d], compID [%d] of DolbyVision does not support cross-compatibility.",
+              demux->dv_profile, demux->dv_bl_signal_comp_id));
+      return FALSE;
+    }
+  } else {
+    /* If the platform supports Dolby Vision, check if configurations are valid. */
+    /* Check backward compatibility ID */
+    if (demux->dv_bl_signal_comp_id != 0 && demux->dv_bl_signal_comp_id != 1
+        && demux->dv_bl_signal_comp_id != 2 && demux->dv_bl_signal_comp_id != 4
+        && demux->dv_bl_signal_comp_id != 6) {
+      GST_ELEMENT_ERROR (demux, STREAM, DEMUX,
+          (("This file has wrong file format.")),
+          ("This BL signal compatibility ID [%d] of DolbyVision is not supported.",
+              demux->dv_bl_signal_comp_id));
+      return FALSE;
+    }
+
+    /* Check dolby box configuration */
+    /* FIXME: Handle as BL signal compatibility for not-certified profileID.
+     * Do not send dolby-vision signal to avoid opening with Dolby driver */
+    if (demux->dv_profile == 7) {
+      GST_DEBUG_OBJECT (demux,
+          "Dolby Vision profile 7 is not supported, but can play as HDR10.");
+      return TRUE;
+    } else if (demux->dv_profile < 7) {
+      if (demux->dv_box_conf != DVCC) {
+        GST_ELEMENT_ERROR (demux, STREAM, DEMUX,
+            (("This file has wrong file format.")),
+            ("Profile [%d] and Box Configuration [%d] does not match.",
+                demux->dv_profile, demux->dv_box_conf));
+        return FALSE;
+      }
+    } else if (demux->dv_profile > 7) {
+      if (demux->dv_box_conf != DVVC) {
+        GST_ELEMENT_ERROR (demux, STREAM, DEMUX,
+            (("This file has wrong file format.")),
+            ("Profile [%d] and Box Configuration [%d] does not match.",
+                demux->dv_profile, demux->dv_box_conf));
+        return FALSE;
+      }
+    } else {
+      GST_ELEMENT_ERROR (demux, STREAM, DEMUX,
+          (("This file has wrong file format.")),
+          ("Profile [%d] and Box Configuration [%d] does not match.",
+              demux->dv_profile, demux->dv_box_conf));
+      return FALSE;
+    }
+
+    /* Set as Dolby Vision */
+    GST_DEBUG_OBJECT (demux,
+        "Set dolby-vision TRUE for profileID [%d], compID [%d]",
+        demux->dv_profile, demux->dv_bl_signal_comp_id);
+    gst_caps_set_simple (context->caps, "dolby-vision", G_TYPE_BOOLEAN, TRUE,
+        NULL);
+    if (demux->dv_profile != -1)
+      gst_caps_set_simple (context->caps, "dolby-vision-profile",
+          G_TYPE_INT, demux->dv_profile, NULL);
+  }
+
+  /* Check single- or dual-track */
+  if (demux->has_dolby_bl_cand && demux->has_dolby_el_cand) {
+    gst_caps_set_simple (context->caps, "need-compositor",
+        G_TYPE_BOOLEAN, TRUE, "dolby-vision-track", G_TYPE_STRING, "dual",
+        NULL);
+  }
+
+  return TRUE;
+}
+#endif
 
 gboolean
 gst_matroska_demux_plugin_init (GstPlugin * plugin)

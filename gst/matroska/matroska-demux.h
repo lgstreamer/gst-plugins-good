@@ -43,6 +43,19 @@ G_BEGIN_DECLS
 #define GST_IS_MATROSKA_DEMUX_CLASS(klass) \
   (G_TYPE_CHECK_CLASS_TYPE ((klass), GST_TYPE_MATROSKA_DEMUX))
 
+/* DolbyHDR support */
+#define DOLBYHDR_SUPPORT
+
+#ifdef DOLBYHDR_SUPPORT
+enum DolbyBoxConfiguration
+{
+  OTHER,
+  DVCC,
+  DVVC,
+  DVWC
+};
+#endif
+
 typedef struct _GstMatroskaDemux {
   GstElement              parent;
 
@@ -127,6 +140,25 @@ typedef struct _GstMatroskaDemux {
   gboolean                 is_rate_changed;
   gboolean                 scan_next_cluster_push;
   gboolean                 is_flushing;
+
+#ifdef DOLBYHDR_SUPPORT
+  /* Dolby HDR */
+  gboolean dolby_vision_support;
+  gboolean is_dolby_hdr;
+  gboolean has_dolby_bl_cand;
+  gboolean has_dolby_el_cand;
+
+  /* Dolby HDR dvcC info. */
+  gint8 dv_profile;
+  gboolean rpu_present_flag;
+  gboolean el_present_flag;
+  gboolean bl_present_flag;
+  gint8 dv_bl_signal_comp_id;
+
+  /* Dolby Box Configuration */
+  enum DolbyBoxConfiguration dv_box_conf;
+  guint32 dv_fourcc;
+#endif
 } GstMatroskaDemux;
 
 typedef struct _GstMatroskaDemuxClass {
