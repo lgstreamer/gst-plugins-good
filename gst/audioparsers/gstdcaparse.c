@@ -54,21 +54,61 @@
 GST_DEBUG_CATEGORY_STATIC (dca_parse_debug);
 #define GST_CAT_DEFAULT dca_parse_debug
 
+enum _dts_profile
+{
+  DTS_INVALID = -1,
+  DTS_CORE = 1,
+  DTS_DTSH,
+  DTS_DTSL,
+  DTS_DTSE
+} dts_profile;
+
+enum _dts_stream_type
+{
+  DTS_NONE = 0,
+  DTS_CORE_ONLY,
+  DTS_CORE_PLUS_EXT_SUB,
+  DTS_EXT_SUB_ONLY
+} dts_stream_type;
+
+
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("audio/x-dts,"
         " framed = (boolean) true,"
-        " channels = (int) [ 1, 8 ],"
+        " channels = (int) [ 1, 9 ],"
         " rate = (int) [ 8000, 192000 ],"
         " depth = (int) { 14, 16 },"
         " endianness = (int) { LITTLE_ENDIAN, BIG_ENDIAN }, "
-        " block-size = (int) [ 1, MAX], " " frame-size = (int) [ 1, MAX]"));
+        " block-size = (int) [ 1, MAX], " " frame-size = (int) [ 1, MAX];"
+        "audio/x-dtsh,"
+        " framed = (boolean) true,"
+        " channels = (int) [ 1, 9 ],"
+        " rate = (int) [ 8000, 192000 ],"
+        " depth = (int) { 14, 16 },"
+        " endianness = (int) { LITTLE_ENDIAN, BIG_ENDIAN }, "
+        " block-size = (int) [ 1, MAX], " " frame-size = (int) [ 1, MAX];"
+        "audio/x-dtsl,"
+        " framed = (boolean) true,"
+        " channels = (int) [ 1, 9 ],"
+        " rate = (int) [ 8000, 192000 ],"
+        " depth = (int) { 14, 16 },"
+        " endianness = (int) { LITTLE_ENDIAN, BIG_ENDIAN }, "
+        " block-size = (int) [ 1, MAX], " " frame-size = (int) [ 1, MAX];"
+        "audio/x-dtse,"
+        " framed = (boolean) true,"
+        " channels = (int) [ 1, 9 ],"
+        " rate = (int) [ 8000, 192000 ],"
+        " depth = (int) { 14, 16 },"
+        " endianness = (int) { LITTLE_ENDIAN, BIG_ENDIAN }, "
+        " block-size = (int) [ 1, MAX], " " frame-size = (int) [ 1, MAX];"));
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS ("audio/x-dts; " "audio/x-private1-dts"));
+    GST_STATIC_CAPS ("audio/x-dts; " "audio/x-dtsh; " "audio/x-dtsl; "
+        "audio/x-dtse; " "audio/x-private1-dts"));
 
 static void gst_dca_parse_finalize (GObject * object);
 
@@ -82,6 +122,28 @@ static GstCaps *gst_dca_parse_get_sink_caps (GstBaseParse * parse,
     GstCaps * filter);
 static gboolean gst_dca_parse_set_sink_caps (GstBaseParse * parse,
     GstCaps * caps);
+
+static gboolean
+gst_dca_parse_dtsc_header_parse (GstDcaParse * dcaparse,
+    const GstByteReader * reader, guint * frame_size,
+    guint * sample_rate, guint * channels, guint * depth,
+    gint * endianness, guint * num_blocks, guint * samples_per_block,
+    gboolean * terminator);
+
+static gboolean
+gst_dca_parse_header_extsstreams (GstDcaParse * dcaparse,
+    const GstByteReader * reader, guint * ext_size, guint * sample_rate,
+    guint * channels, guint * depth, gint * endianness, guint * num_blocks,
+    guint * samples_per_block, gboolean * terminator);
+
+static gboolean
+gst_dca_parse_find_sync_core (GstDcaParse * dcaparse, GstByteReader * reader,
+    gsize bufsize, guint32 * best_sync, guint * best_offset);
+
+static gboolean
+gst_dca_parse_find_sync_extsstream (GstDcaParse * dcaparse,
+    GstByteReader * reader, gsize bufsize, guint32 * best_sync,
+    guint * best_offset);
 
 #define gst_dca_parse_parent_class parent_class
 G_DEFINE_TYPE (GstDcaParse, gst_dca_parse, GST_TYPE_BASE_PARSE);
@@ -125,6 +187,8 @@ gst_dca_parse_reset (GstDcaParse * dcaparse)
   dcaparse->frame_size = -1;
   dcaparse->last_sync = 0;
   dcaparse->sent_codec_tag = FALSE;
+  dcaparse->dts_stream_type = DTS_NONE;
+  dcaparse->mime_type = NULL;
 }
 
 static void
@@ -166,8 +230,103 @@ gst_dca_parse_stop (GstBaseParse * parse)
   return TRUE;
 }
 
+/**
+ * gst_dca_parse_parse_header:
+ * @dcaparse: #GstDcaParse.
+ * @reader: instance of GstByteReader
+ * @frame_size: Size of frame in bytes
+ * @sample_rate: Audio sample rate
+ * @channels: Num of channels
+ * @depth: Bit depth
+ * @endianness: Endianness of bitstream
+ * @num_blocks: Num of blocks
+ * @samples_per_block: Samples in a block
+ * @terminator: frame termination flag
+ *
+ * Based on dts stream type, parse the header and set the frame parameters.
+ *
+ * Returns: TRUE if parsed successfully.
+ */
 static gboolean
 gst_dca_parse_parse_header (GstDcaParse * dcaparse,
+    const GstByteReader * reader, guint * frame_size,
+    guint * sample_rate, guint * channels, guint * depth,
+    gint * endianness, guint * num_blocks, guint * samples_per_block,
+    gboolean * terminator)
+{
+  guint32 core_size = 0, ext_size = 0;
+  GstByteReader r = *reader;
+
+  switch (dcaparse->dts_stream_type) {
+
+    case DTS_CORE_ONLY:
+      if (!gst_dca_parse_dtsc_header_parse (dcaparse, &r, &core_size,
+              sample_rate, channels, depth, endianness, num_blocks,
+              samples_per_block, terminator)) {
+        GST_LOG_OBJECT (dcaparse, "Valid core header not found");
+        return FALSE;
+      }
+      break;
+
+    case DTS_CORE_PLUS_EXT_SUB:
+      if (!gst_dca_parse_dtsc_header_parse (dcaparse, &r, &core_size,
+              sample_rate, channels, depth, endianness, num_blocks,
+              samples_per_block, terminator)) {
+        GST_LOG_OBJECT (dcaparse,
+            "Valid core header not found, parse extension");
+      }
+      r = *reader;
+      gst_byte_reader_skip_unchecked (&r, core_size);
+      if (!gst_dca_parse_header_extsstreams (dcaparse, &r, &ext_size,
+              sample_rate, channels, depth, endianness,
+              num_blocks, samples_per_block, terminator)) {
+        GST_LOG_OBJECT (dcaparse,
+            "Valid extension header not found, return core only if valid");
+        if (core_size == 0 && ext_size == 0)
+          return FALSE;
+      }
+      break;
+
+    case DTS_EXT_SUB_ONLY:
+      if (!gst_dca_parse_header_extsstreams (dcaparse, &r, &ext_size,
+              sample_rate, channels, depth, endianness,
+              num_blocks, samples_per_block, terminator)) {
+        GST_LOG_OBJECT (dcaparse, "Valid extension header not found");
+        return FALSE;
+      }
+      break;
+    default:
+      GST_LOG_OBJECT (dcaparse, "Valid stream format not found");
+      return FALSE;
+      break;
+  }
+
+  *frame_size = core_size + ext_size;
+  GST_DEBUG_OBJECT (dcaparse,
+      "frame_size(%d) core_size(%d) ext_size (%d)", *frame_size,
+      core_size, ext_size);
+  return TRUE;
+}
+
+/**
+ * gst_dca_parse_dtsc_header_parse:
+ * @dcaparse: #GstDcaParse.
+ * @reader: instance of GstByteReader
+ * @core_size: Size of core data in bytes
+ * @sample_rate: Audio sample rate
+ * @channels: Num of channels
+ * @depth: Bit depth
+ * @endianness: Endianness of bitstream
+ * @num_blocks: Num of blocks
+ * @samples_per_block: Samples in a block
+ * @terminator: frame termination flag
+ *
+ * Parse the DTS core header and set the frame parameters.
+ *
+ * Returns: TRUE if parsed successfully.
+ */
+static gboolean
+gst_dca_parse_dtsc_header_parse (GstDcaParse * dcaparse,
     const GstByteReader * reader, guint * frame_size,
     guint * sample_rate, guint * channels, guint * depth,
     gint * endianness, guint * num_blocks, guint * samples_per_block,
@@ -183,7 +342,6 @@ gst_dca_parse_parse_header (GstDcaParse * dcaparse,
   guint16 hdr[8];
   guint32 marker;
   guint chans, lfe, i;
-
   if (gst_byte_reader_get_remaining (&r) < (4 + sizeof (hdr)))
     return FALSE;
 
@@ -198,6 +356,11 @@ gst_dca_parse_parse_header (GstDcaParse * dcaparse,
   if (marker == 0xFE7F0180 || marker == 0xFF1F00E8) {
     for (i = 0; i < G_N_ELEMENTS (hdr); ++i)
       hdr[i] = gst_byte_reader_get_uint16_le_unchecked (&r);
+  } else
+    /* Sync word for core Sub stream Extension 0x02b09261 */
+  if (marker == 0x02b09261) {
+    for (i = 0; i < G_N_ELEMENTS (hdr); ++i)
+      hdr[i] = gst_byte_reader_get_uint16_be_unchecked (&r);
   } else {
     return FALSE;
   }
@@ -232,15 +395,12 @@ gst_dca_parse_parse_header (GstDcaParse * dcaparse,
   *sample_rate = sample_rates[(hdr[4] >> 10) & 0x0F];
   lfe = (hdr[5] >> 9) & 0x03;
 
-  GST_TRACE_OBJECT (dcaparse, "frame size %u, num_blocks %u, rate %u, "
+  GST_LOG_OBJECT (dcaparse, "frame_size %u, num_blocks %u, rate %u, "
       "samples per block %u", *frame_size, *num_blocks, *sample_rate,
       *samples_per_block);
 
   if (*num_blocks < 6 || *frame_size < 96 || *sample_rate == 0)
     return FALSE;
-
-  if (marker == 0x1FFFE800 || marker == 0xFF1F00E8)
-    *frame_size = (*frame_size * 16) / 14;      /* FIXME: round up? */
 
   if (chans < G_N_ELEMENTS (channels_table))
     *channels = channels_table[chans] + ((lfe) ? 1 : 0);
@@ -253,37 +413,522 @@ gst_dca_parse_parse_header (GstDcaParse * dcaparse,
     *endianness = (marker == 0xFE7F0180 || marker == 0xFF1F00E8) ?
         G_LITTLE_ENDIAN : G_BIG_ENDIAN;
 
-  GST_TRACE_OBJECT (dcaparse, "frame size %u, channels %u, rate %u, "
+  GST_LOG_OBJECT (dcaparse, "frame_size %u, channels %u, rate %u, "
       "num_blocks %u, samples_per_block %u", *frame_size, *channels,
       *sample_rate, *num_blocks, *samples_per_block);
 
   return TRUE;
 }
 
+/**
+ * gst_dca_parse_ext_header:
+ * @dcaparse: #GstDcaParse.
+ * @reader: instance of GstByteReader
+ * @header_size: Ext sub stream header size
+ * @ext_frame_size: Ext sub stream size
+ *
+ * Parse Extension Substream Header to find the header size and frame size.
+ *
+ * Returns: TRUE if parsed successfully.
+ */
+static gboolean
+gst_dca_parse_ext_header (GstDcaParse * dcaparse,
+    const GstByteReader * reader, guint16 * header_size, guint * ext_frame_size,
+    guint8 * nExtSSIndex)
+{
+  GstByteReader r = *reader;
+  guint16 hdr[8], nuExtSSHeaderSize;
+  guint32 nuExtSSFSize;
+  guint8 i;
+  gboolean bHeaderSizeType;
+  gboolean bStaticFieldsPresent;
+  static const guint RefClockPeriod[3] = { 32000, 44100, 48000 };
+  guint8 nuRefClockCode;
+  guint32 nuExSSFrameDurationCode;
+  GstClockTime ExSSFrameDuration = GST_CLOCK_TIME_NONE;
+  GstBaseParse *parse = &(dcaparse->baseparse);
+  guint32 marker = 0;
+  if (!gst_byte_reader_peek_uint32_be (reader, &marker)) {
+    GST_LOG_OBJECT (dcaparse, "Fail to find the marker");
+    return FALSE;
+  }
+
+  /* raw big endian or 14-bit big endian */
+  if (marker == DTS_SYNCWORD_SUBSTREAM) {
+    for (i = 0; i < G_N_ELEMENTS (hdr); ++i)
+      hdr[i] = gst_byte_reader_get_uint16_be_unchecked (&r);
+  } else {
+    GST_LOG_OBJECT (dcaparse, "Fail to find the Extension Substream syncword");
+    return FALSE;
+  }
+
+  GST_LOG_OBJECT (dcaparse, "dts sync marker 0x%08x at offset %u", marker,
+      gst_byte_reader_get_pos (reader));
+
+  GST_LOG_OBJECT (dcaparse, "frame header: %04x%04x%04x%04x",
+      hdr[2], hdr[3], hdr[4], hdr[5]);
+
+  *nExtSSIndex = (hdr[2] & 0x00c0) >> 6;
+
+  /* bHeaderSizeType is 1 bit at 5th position  */
+  bHeaderSizeType = hdr[2] & 0x0020;
+  if (bHeaderSizeType == 0) {
+    /*Extract next 8-bit if bHeaderSizeType is 0 */
+    nuExtSSHeaderSize =
+        (((hdr[2] & 0x001f) << 3) | ((hdr[3] & 0xe000) >> 13)) + 1;
+    /*Extract next 16 bit for Ext Frame size */
+    nuExtSSFSize = ((hdr[3] & 0x1fff) << 3 | ((hdr[4] & 0xe000) >> 13)) + 1;
+    /* Extract StaticFields */
+    bStaticFieldsPresent = (hdr[4] & 0x1000) >> 12;
+    if (bStaticFieldsPresent) {
+      nuRefClockCode = (hdr[4] & 0x0c00) >> 10;
+      if (nuRefClockCode < 3) {
+        nuExSSFrameDurationCode = 512 * (((hdr[4] & 0x0380) >> 7) + 1);
+        ExSSFrameDuration =
+            gst_util_uint64_scale (GST_SECOND, nuExSSFrameDurationCode,
+            RefClockPeriod[nuRefClockCode]);
+
+        GST_LOG_OBJECT (dcaparse,
+            "nuRefClockCode: (%u), nuExSSFrameDurationCode: (%u), ExSSFrameDur: %"
+            G_GINT64_FORMAT "s", nuRefClockCode, nuExSSFrameDurationCode,
+            ExSSFrameDuration);
+      } else {
+        GST_LOG_OBJECT (dcaparse, "nuRefClockCode is %u in invalid range",
+            nuRefClockCode);
+      }
+    }
+
+  } else {
+    /*Extract next 12 bits if bHeaderSizeType is 1 */
+    nuExtSSHeaderSize =
+        (((hdr[2] & 0x001f) << 7) | ((hdr[3] & 0xfe00) >> 9)) + 1;
+    /*Extract next 20 bits for Ext Frame size */
+    nuExtSSFSize =
+        (((hdr[3] & 0x000001ff) << 11) | ((hdr[4] & 0x0000ffe0) >> 5)) + 1;
+    /* Extract StaticFields */
+    bStaticFieldsPresent = (hdr[4] & 0x10) >> 4;
+    if (bStaticFieldsPresent) {
+      nuRefClockCode = (hdr[4] & 0x0c) >> 2;
+      if (nuRefClockCode < 3) {
+        nuExSSFrameDurationCode =
+            512 * (((hdr[4] & 0x03) | ((hdr[5] & 0x8000) >> 15)) + 1);
+        ExSSFrameDuration =
+            gst_util_uint64_scale (GST_SECOND, nuExSSFrameDurationCode,
+            RefClockPeriod[nuRefClockCode]);
+
+        GST_LOG_OBJECT (dcaparse,
+            "nuRefClockCode: (%u), nuExSSFrameDurationCode: (%u), ExSSFrameDur: %"
+            G_GINT64_FORMAT "s", nuRefClockCode, nuExSSFrameDurationCode,
+            ExSSFrameDuration);
+      } else {
+        GST_LOG_OBJECT (dcaparse, "nuRefClockCode is %u in invalid range",
+            nuRefClockCode);
+      }
+    }
+  }
+  if (bStaticFieldsPresent && (nuRefClockCode < 3))
+    gst_base_parse_set_frame_rate (parse, RefClockPeriod[nuRefClockCode],
+        nuExSSFrameDurationCode, 0, 0);
+
+  GST_LOG_OBJECT (dcaparse,
+      "nuExtSSHeaderSize(%04x) nuExtSSFSize(%08x) nExtSSIndex(%u)",
+      nuExtSSHeaderSize, nuExtSSFSize, *nExtSSIndex);
+
+  *header_size = nuExtSSHeaderSize;
+  *ext_frame_size = nuExtSSFSize;
+
+  return TRUE;
+}
+
+/**
+ * gst_dca_parse_header_dtsl:
+ * @dcaparse: #GstDcaParse.
+ * @reader: instance of GstByteReader
+ * @sample_rate: Audio sample rate
+ * @channels: Num of channels
+ * @depth: Bit depth
+ * @endianness: Endianness of bitstream
+ * @num_blocks: Num of blocks
+ * @samples_per_block: Samples in a block
+ * @terminator: frame termination flag
+ *
+ * Parse the DTS Lossless Extension header and set the frame parameters.
+ *
+ * Returns: TRUE if parsed successfully.
+ */
+static gboolean
+gst_dca_parse_header_dtsl (GstDcaParse * dcaparse,
+    GstByteReader * reader, guint * sample_rate,
+    guint * channels, guint * depth, gint * endianness, guint * num_blocks,
+    guint * samples_per_block, gboolean * terminator)
+{
+  static const int sample_rates[16] = { 8000, 16000, 32000, 64000, 128000,
+    22050, 44100, 88200, 176400, 352800,
+    12000, 24000, 48000, 96000, 192000, 384000
+  };
+
+  guint16 hdr[16];
+  guint i, bit_depth, byte_order;
+  guint nTempSize, nLLFrameSize, nChSetLLChannel = 0;
+  guint8 nHeaderSize, nBits4FrameFsize, nHeaderIndex = 0, nBitIndex = 0;
+  guint16 sFreqIndex = 0;
+  guint nFirst = 0, nSecond = 0;
+  guint32 marker = gst_byte_reader_peek_uint32_be_unchecked (reader);
+
+
+  /* raw big endian */
+  if (marker == DTS_SYNCWORD_XLL) {
+    for (i = 0; i < G_N_ELEMENTS (hdr); ++i)
+      hdr[i] = gst_byte_reader_get_uint16_be_unchecked (reader);
+  } else {
+    return FALSE;
+  }
+
+  GST_DEBUG_OBJECT (dcaparse, "dts sync marker 0x%08x at offset %u", marker,
+      gst_byte_reader_get_pos (reader));
+
+  nHeaderSize = ((hdr[2] & 0x0FF0) >> 4) + 1;
+  nBits4FrameFsize = (((hdr[2] & 0x000F) << 1) | ((hdr[3] & 0x8000) >> 15)) + 1;
+
+  nTempSize =
+      ((hdr[3] & 0x7FFF) << 17) | (hdr[4] << 1) | ((hdr[5] & 0x8000) >> 15);
+
+  nLLFrameSize =
+      ((nTempSize & (((1L << nBits4FrameFsize) - 1) << (32 -
+                  nBits4FrameFsize))) >> (32 - nBits4FrameFsize)) + 1;
+  nHeaderIndex = 3 + ((nBits4FrameFsize + 1) / 16);
+  nBitIndex = ((1 + nBits4FrameFsize) % 16);
+  if ((nBitIndex + 4) >= 16) {
+    nSecond = (nBitIndex + 4) - 16;
+    nFirst = 4 - nSecond;
+    nBitIndex = nSecond;
+    ++nHeaderIndex;
+  } else {
+    nBitIndex += 4;
+  }
+
+  /* Jump to parse sub-header */
+  /* Using a 16 bit reader, hence need to skip half the size */
+  nHeaderIndex = (nHeaderSize / 2);
+  if ((nHeaderIndex + 1) >= 16) {
+    /* To fix klocworks defect. Actually we need to use only till 12th element at max */
+    GST_INFO_OBJECT (dcaparse, "Array out bound");
+  } else {
+    if ((nHeaderSize % 2) == 0) {
+      nChSetLLChannel = ((hdr[nHeaderIndex] & 0x003C) >> 2) + 1;
+
+      /* Skip 10 + 4 + nChSetLLChannel +  5 + 5 */
+      nHeaderIndex += ((10 + 4 + nChSetLLChannel + 5 + 5) / 16);
+      nBitIndex = ((10 + 4 + nChSetLLChannel + 5 + 5) % 16);
+    } else {
+      nChSetLLChannel = ((hdr[nHeaderIndex + 1] & 0x3C00) >> 10) + 1;
+      /* Skip 8 + 10 + 4 + nChSetLLChannel +  5 + 5 */
+      nHeaderIndex += ((18 + 4 + nChSetLLChannel + 5 + 5) / 16);
+      nBitIndex = ((18 + 4 + nChSetLLChannel + 5 + 5) % 16);
+    }
+    if ((nHeaderIndex + 1) >= 16) {
+      /* To fix klocworks defect. Actually we need to use only till 12th element at max */
+      GST_INFO_OBJECT (dcaparse, "Array out bound");
+    } else {
+      if ((nBitIndex + 4) >= 16) {
+        nSecond = (nBitIndex + 4) - 16;
+        nFirst = 4 - nSecond;
+        sFreqIndex = (((hdr[nHeaderIndex] & ((1L << nFirst) - 1)) << nSecond)
+            | ((hdr[nHeaderIndex + 1] & (((1L << nSecond) - 1) << (16 -
+                            nSecond))) >> (16 - nSecond)));
+      } else
+        sFreqIndex =
+            ((hdr[nHeaderIndex] & (((1 << 4) - 1) << (16 - 4 -
+                        nBitIndex))) >> (16 - 4 - nBitIndex));
+    }
+  }
+
+  bit_depth = 16;
+  byte_order = G_BIG_ENDIAN;
+
+  if (depth)
+    *depth = 16;
+  if (endianness)
+    *endianness = G_BIG_ENDIAN;
+  *sample_rate = sample_rates[sFreqIndex];
+  if (*sample_rate < 16000)
+    *samples_per_block = 1024;
+  else if (*sample_rate < 32000)
+    *samples_per_block = 2048;
+  else
+    *samples_per_block = 4096;
+  *channels = nChSetLLChannel;
+  *num_blocks = 0;              /*Default */
+
+  GST_LOG_OBJECT (dcaparse,
+      "After parsing, values are nLLHeaderSize = %d\tnBits4FrameFsize=%d\tnLLFrameSize=%d\t\
+       nChSetLLChannel=%d\tsFreqIndex=%d\tdepth=%d\tendianness=%d",
+      nHeaderSize, nBits4FrameFsize, nLLFrameSize, nChSetLLChannel, sFreqIndex, bit_depth, byte_order);
+
+  return TRUE;
+
+}
+
+/**
+ * gst_dca_parse_header_lbr:
+ * @dcaparse: #GstDcaParse.
+ * @reader: instance of GstByteReader
+ * @sample_rate: Audio sample rate
+ * @channels: Num of channels
+ * @depth: Bit depth
+ * @endianness: Endianness of bitstream
+ * @num_blocks: Num of blocks
+ * @samples_per_block: Samples in a block
+ * @terminator: frame termination flag
+ *
+ * Parse the DTS Low bit rate extension header and set the frame parameters.
+ *
+ * Returns: TRUE if parsed successfully.
+ */
+static gboolean
+gst_dca_parse_header_lbr (GstDcaParse * dcaparse,
+    GstByteReader * reader, guint * sample_rate,
+    guint * channels, guint * depth, gint * endianness, guint * num_blocks,
+    guint * samples_per_block, gboolean * terminator)
+{
+
+  static const int sample_rates[16] = { 8000, 16000, 32000, 0, 0,
+    22050, 44100, 0, 0, 0,
+    12000, 24000, 48000, 0, 0, 0
+  };
+  static const int speaker_mask[16] = { 1, 2, 2, 1, 1, 2, 2, 1,
+    1, 2, 2, 2, 1, 2, 1, 2
+  };
+  guint i;
+  guint16 hdr[8];
+  guint32 marker;
+
+  guint8 ucFmtInfoCode, nLBRSampleRateCode, nLBRBitRateMSnybbles;
+  guint16 nLBROriginalBitRate_LSW, nLBRScaledBitRate_LSW, usLBRSpkrMask;
+  guint32 nuOriginatBitrate, nuScaledBitrate;
+
+  marker = gst_byte_reader_peek_uint32_be_unchecked (reader);
+  /* raw big endian */
+  if (marker == DTS_SYNCWORD_LBR) {
+    for (i = 0; i < G_N_ELEMENTS (hdr); ++i)
+      hdr[i] = gst_byte_reader_get_uint16_be_unchecked (reader);
+  } else {
+    return FALSE;
+  }
+  GST_DEBUG_OBJECT (dcaparse, "lbr sync marker 0x%08x at offset %u", marker,
+      gst_byte_reader_get_pos (reader));
+  ucFmtInfoCode = hdr[2] >> 8;
+  if (ucFmtInfoCode == 2) {
+    GST_LOG_OBJECT (dcaparse, "LBR decoder initialization data");
+    nLBRSampleRateCode = (hdr[2] & 0x00ff);
+    usLBRSpkrMask = (hdr[3] >> 8) | (hdr[3] << 8);
+    nLBRBitRateMSnybbles = (hdr[5] & 0x00ff);
+    nLBROriginalBitRate_LSW = (hdr[6] >> 8) | (hdr[6] << 8);
+    nLBRScaledBitRate_LSW = (hdr[7] >> 8) | (hdr[7] << 8);
+    nuOriginatBitrate =
+        nLBROriginalBitRate_LSW | ((nLBRBitRateMSnybbles & 0x0F) << 16);
+    nuScaledBitrate =
+        nLBRScaledBitRate_LSW | ((nLBRBitRateMSnybbles & 0xF0) << 12);
+    GST_LOG_OBJECT (dcaparse, "nuOriginatBitrate (%u) nuScaledBitrate (%u)",
+        nuOriginatBitrate, nuScaledBitrate);
+    *sample_rate = sample_rates[nLBRSampleRateCode];
+    *endianness = G_BIG_ENDIAN;
+    *depth = 16;
+    if (*sample_rate < 16000)
+      *samples_per_block = 1024;
+    else if (*sample_rate < 32000)
+      *samples_per_block = 2048;
+    else
+      *samples_per_block = 4096;
+    *num_blocks = 0;            /*Default */
+
+    *channels = 0;
+    if (usLBRSpkrMask) {
+      for (i = 0; i < 16; i++) {
+        if ((0x0001 << i) & usLBRSpkrMask)
+          *channels += speaker_mask[i];
+      }
+    } else {
+      GST_LOG_OBJECT (dcaparse, "LBRSpeaker mask is not set.");
+    }
+
+    GST_LOG_OBJECT (dcaparse,
+        "usLBRSpkrMask (%04x) sample_rate (%d) channels (%d)", usLBRSpkrMask,
+        *sample_rate, *channels);
+  } else if (ucFmtInfoCode != 1) {
+    GST_LOG_OBJECT (dcaparse, "format information not valid");
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * gst_dca_parse_header_extsstreams:
+ * @dcaparse: #GstDcaParse.
+ * @reader: instance of GstByteReader
+ * @ext_size: Size of Ext Sub data in bytes
+ * @sample_rate: Audio sample rate
+ * @channels: Num of channels
+ * @depth: Bit depth
+ * @endianness: Endianness of bitstream
+ * @num_blocks: Num of blocks
+ * @samples_per_block: Samples in a block
+ * @terminator: frame termination flag
+ *
+ * Parse Extension Substream header and set the frame parameters.
+ *
+ * Returns: TRUE if parsed successfully.
+ */
+static gboolean
+gst_dca_parse_header_extsstreams (GstDcaParse * dcaparse,
+    const GstByteReader * reader, guint * ext_size, guint * sample_rate,
+    guint * channels, guint * depth, gint * endianness, guint * num_blocks,
+    guint * samples_per_block, gboolean * terminator)
+{
+  guint32 sync_word, core_substream_size, nuExtSSFSize = 0;
+  guint16 nuExtSSHeaderSize = 0;
+  gint dts_profile = DTS_INVALID;
+  guint8 nExtSSIndex, SSIndex_lookup = 0;
+  GstByteReader r = *reader;
+  gboolean ret = TRUE;
+
+  while (gst_dca_parse_ext_header (dcaparse, &r, &nuExtSSHeaderSize,
+          &nuExtSSFSize, &nExtSSIndex)) {
+    if (SSIndex_lookup & (0x01 << nExtSSIndex))
+      break;
+
+    SSIndex_lookup |= (0x01 << nExtSSIndex);
+
+    (*ext_size) += nuExtSSFSize;
+
+    if (dts_profile == DTS_INVALID
+        && dcaparse->dts_stream_type == DTS_EXT_SUB_ONLY) {
+      GstByteReader r1 = *reader;
+      gst_byte_reader_skip (&r1, nuExtSSHeaderSize);
+      sync_word = gst_byte_reader_peek_uint32_be_unchecked (&r1);
+      GST_LOG_OBJECT (dcaparse, "Next Sync (%08x)", sync_word);
+      switch (sync_word) {
+        case DTS_SYNCWORD_LBR:
+          GST_LOG_OBJECT (dcaparse, "Found sync for LBR");
+          if (!gst_dca_parse_header_lbr (dcaparse, &r1,
+                  sample_rate, channels, depth, endianness,
+                  num_blocks, samples_per_block, terminator)) {
+            ret = FALSE;
+            return ret;
+          }
+          dts_profile = DTS_DTSE;
+          break;
+        case DTS_SYNCWORD_XLL:
+          GST_LOG_OBJECT (dcaparse, "Found sync for XLL");
+          if (!gst_dca_parse_header_dtsl (dcaparse, &r1,
+                  sample_rate, channels, depth, endianness,
+                  num_blocks, samples_per_block, terminator)) {
+            ret = FALSE;
+            return ret;
+          }
+          dts_profile = DTS_DTSL;
+          break;
+        case DTS_SYNCWORD_SUBSTREAM_CORE:
+          GST_LOG_OBJECT (dcaparse, "Found sync for core substream");
+          if (!gst_dca_parse_dtsc_header_parse (dcaparse, &r1,
+                  &core_substream_size, sample_rate, channels, depth,
+                  endianness, num_blocks, samples_per_block, terminator)) {
+            ret = FALSE;
+            return ret;
+          }
+          dts_profile = DTS_DTSH;
+          break;
+        default:
+          GST_LOG_OBJECT (dcaparse, "No sync found, setting default as DTSH");
+          dts_profile = DTS_DTSH;
+          break;
+      }
+    }
+    gst_byte_reader_skip (&r, nuExtSSFSize);
+  }
+
+  if (*ext_size == 0)
+    ret = FALSE;
+
+  return ret;
+}
+
+/**
+ * gst_dca_parse_find_sync:
+ * @dcaparse: #GstDcaParse.
+ * @reader: instance of GstByteReader
+ * @bufsize: Size of buffer
+ * @sync: Sync word
+ *
+ * Find Sync word and its offset.
+ *
+ * Returns: Sync word offset or Fail if sync word is not found.
+ */
 static gint
 gst_dca_parse_find_sync (GstDcaParse * dcaparse, GstByteReader * reader,
     gsize bufsize, guint32 * sync)
 {
   guint32 best_sync = 0;
   guint best_offset = G_MAXUINT;
+
+  /*find sync for core */
+  if (gst_dca_parse_find_sync_core (dcaparse, reader,
+          bufsize, &best_sync, &best_offset)) {
+    GST_DEBUG_OBJECT (dcaparse, "found sync for core dts");
+  }
+
+  /*find sync for extension stream */
+  if (gst_dca_parse_find_sync_extsstream (dcaparse, reader,
+          bufsize, &best_sync, &best_offset)) {
+    GST_DEBUG_OBJECT (dcaparse, "found sync for extension stream");
+  }
+
+  if (best_offset == G_MAXUINT)
+    return -1;
+
+  GST_DEBUG_OBJECT (dcaparse, "Syncword Returned(%08x)", best_sync);
+
+  *sync = best_sync;
+  return best_offset;
+
+}
+
+
+/**
+ * gst_dca_parse_find_sync_core:
+ * @dcaparse: #GstDcaParse.
+ * @reader: instance of GstByteReader
+ * @bufsize: Size of buffer
+ * @best_sync: Sync word
+ * @best_offset: Offset of sync word in the buffer
+ *
+ * Search for core sync word and its offset.
+ *
+ * Returns: True if core sync word is found or Fail if core sync word is not found.
+ */
+static gboolean
+gst_dca_parse_find_sync_core (GstDcaParse * dcaparse, GstByteReader * reader,
+    gsize bufsize, guint32 * best_sync, guint * best_offset)
+{
   gint off;
+  gboolean ret;
 
   /* FIXME: verify syncs via _parse_header() here already */
 
   /* Raw little endian */
   off = gst_byte_reader_masked_scan_uint32 (reader, 0xffffffff, 0xfe7f0180,
       0, bufsize);
-  if (off >= 0 && off < best_offset) {
-    best_offset = off;
-    best_sync = 0xfe7f0180;
+  if (off >= 0 && off < *best_offset) {
+    *best_offset = off;
+    *best_sync = 0xfe7f0180;
   }
 
   /* Raw big endian */
   off = gst_byte_reader_masked_scan_uint32 (reader, 0xffffffff, 0x7ffe8001,
       0, bufsize);
-  if (off >= 0 && off < best_offset) {
-    best_offset = off;
-    best_sync = 0x7ffe8001;
+  if (off >= 0 && off < *best_offset) {
+    *best_offset = off;
+    *best_sync = 0x7ffe8001;
   }
 
   /* FIXME: check next 2 bytes as well for 14-bit formats (but then don't
@@ -292,24 +937,74 @@ gst_dca_parse_find_sync (GstDcaParse * dcaparse, GstByteReader * reader,
   /* 14-bit little endian  */
   off = gst_byte_reader_masked_scan_uint32 (reader, 0xffffffff, 0xff1f00e8,
       0, bufsize);
-  if (off >= 0 && off < best_offset) {
-    best_offset = off;
-    best_sync = 0xff1f00e8;
+  if (off >= 0 && off < *best_offset) {
+    *best_offset = off;
+    *best_sync = 0xff1f00e8;
   }
 
   /* 14-bit big endian  */
   off = gst_byte_reader_masked_scan_uint32 (reader, 0xffffffff, 0x1fffe800,
       0, bufsize);
-  if (off >= 0 && off < best_offset) {
-    best_offset = off;
-    best_sync = 0x1fffe800;
+  if (off >= 0 && off < *best_offset) {
+    *best_offset = off;
+    *best_sync = 0x1fffe800;
+  }
+  if (*best_offset == G_MAXUINT) {
+    ret = FALSE;
+  } else {
+    dcaparse->dts_stream_type = DTS_CORE_ONLY;
+    ret = TRUE;
+  }
+  return ret;
+}
+
+/**
+ * gst_dca_parse_find_sync_extsstream:
+ * @dcaparse: #GstDcaParse.
+ * @reader: instance of GstByteReader
+ * @bufsize: Size of buffer
+ * @best_sync: Sync word
+ * @best_offset: Offset of sync word in the buffer
+ *
+ * Search for Ext Sub stream sync word and its offset.
+ *
+ * Returns: True if core sync word is found or Fail if core sync word is not found.
+ */
+static gboolean
+gst_dca_parse_find_sync_extsstream (GstDcaParse * dcaparse,
+    GstByteReader * reader, gsize bufsize, guint32 * best_sync,
+    guint * best_offset)
+{
+  gint off;
+  guint32 best_sync_ext_sub, best_offset_ext_sub;
+  gboolean ret;
+
+  best_sync_ext_sub = 0;
+  best_offset_ext_sub = G_MAXUINT;
+
+  /* Raw big endian */
+  off = gst_byte_reader_masked_scan_uint32 (reader, 0xffffffff,
+      DTS_SYNCWORD_SUBSTREAM, 0, bufsize);
+  if (off >= 0 && off < best_offset_ext_sub) {
+    best_offset_ext_sub = off;
+    best_sync_ext_sub = DTS_SYNCWORD_SUBSTREAM;
   }
 
-  if (best_offset == G_MAXUINT)
-    return -1;
+  if (best_offset_ext_sub != G_MAXUINT) {
+    if (dcaparse->dts_stream_type == DTS_CORE_ONLY) {
+      dcaparse->dts_stream_type = DTS_CORE_PLUS_EXT_SUB;
+    } else {
+      dcaparse->dts_stream_type = DTS_EXT_SUB_ONLY;
+      *best_offset = best_offset_ext_sub;
+      *best_sync = best_sync_ext_sub;
+    }
+    ret = TRUE;
 
-  *sync = best_sync;
-  return best_offset;
+  } else {
+    ret = FALSE;
+  }
+
+  return ret;
 }
 
 static GstFlowReturn
@@ -328,7 +1023,6 @@ gst_dca_parse_handle_frame (GstBaseParse * parse,
   gint off = -1;
   GstMapInfo map;
   GstFlowReturn ret = GST_FLOW_EOS;
-  gsize extra_size = 0;
 
   gst_buffer_map (buf, &map, GST_MAP_READ);
 
@@ -344,6 +1038,7 @@ gst_dca_parse_handle_frame (GstBaseParse * parse,
   if (G_LIKELY (parser_in_sync && dcaparse->last_sync != 0)) {
     off = gst_byte_reader_masked_scan_uint32 (&r, 0xffffffff,
         dcaparse->last_sync, 0, map.size);
+    sync = dcaparse->last_sync;
   }
 
   if (G_UNLIKELY (off < 0)) {
@@ -376,6 +1071,29 @@ gst_dca_parse_handle_frame (GstBaseParse * parse,
       sync, size, rate, chans);
 
   dcaparse->last_sync = sync;
+
+  /*
+     Find out next sync word from the framesize obtained from frame header
+     modify size if no  Core and substream syncword is found
+   */
+  if (map.size >= size + 4) {
+    if (sync == 0x1FFFE800 || sync == 0xFF1F00E8) {
+      guint32 marker_next;
+      gst_byte_reader_init (&r, map.data, map.size);
+      gst_byte_reader_skip_unchecked (&r, size);
+      marker_next = gst_byte_reader_peek_uint32_be_unchecked (&r);
+      if (marker_next != 0x7FFE8001 && marker_next != 0x1FFFE800 &&
+          marker_next != 0xFE7F0180 && marker_next != 0xFF1F00E8 &&
+          marker_next != 0x64582025 && marker_next != 0x02b09261 &&
+          marker_next != 0x58642520 && marker_next != 0xb0026192) {
+        if (((size * 16) % 14) != 0)
+          size = size - 1;
+        size = (size * 16) / 14;        /* FIXME: round up? */
+        GST_DEBUG_OBJECT (dcaparse, "framesize recalculated to %u", size);
+      }
+    }
+  } else
+    goto cleanup;
 
   /* FIXME: Don't look for a second syncword, there are streams out there
    * that consistently contain garbage between every frame so we never ever
@@ -423,17 +1141,41 @@ gst_dca_parse_handle_frame (GstBaseParse * parse,
 
   if (G_UNLIKELY (dcaparse->rate != rate || dcaparse->channels != chans
           || dcaparse->depth != depth || dcaparse->endianness != endianness
-          || (!terminator && dcaparse->block_size != block_size)
-          || (size != dcaparse->frame_size))) {
-    GstCaps *caps;
+          || (!terminator && block_size > 0
+              && dcaparse->block_size != block_size))) {
+    GstCaps *caps = NULL;
+    GstStructure *s = NULL;
 
-    caps = gst_caps_new_simple ("audio/x-dts",
+    if (dcaparse->mime_type == NULL) {
+      caps = gst_pad_get_current_caps (parse->sinkpad);
+      if (caps) {
+        s = gst_caps_get_structure (caps, 0);
+        if (gst_structure_has_name (s, "audio/x-dtse"))
+          dcaparse->mime_type = "audio/x-dtse";
+        else if (gst_structure_has_name (s, "audio/x-dtsh"))
+          dcaparse->mime_type = "audio/x-dtsh";
+        else if (gst_structure_has_name (s, "audio/x-dtsl"))
+          dcaparse->mime_type = "audio/x-dtsl";
+        else
+          dcaparse->mime_type = "audio/x-dts";
+        gst_caps_unref (caps);
+      } else {
+        GST_DEBUG_OBJECT (dcaparse, "Failed to get media type from upstream");
+        return GST_FLOW_ERROR;
+      }
+    }
+
+    caps = gst_caps_new_simple (dcaparse->mime_type,
         "framed", G_TYPE_BOOLEAN, TRUE,
         "rate", G_TYPE_INT, rate, "channels", G_TYPE_INT, chans,
         "endianness", G_TYPE_INT, endianness, "depth", G_TYPE_INT, depth,
         "block-size", G_TYPE_INT, block_size, "frame-size", G_TYPE_INT, size,
         NULL);
-    gst_pad_set_caps (GST_BASE_PARSE_SRC_PAD (parse), caps);
+
+    if (!gst_pad_set_caps (GST_BASE_PARSE_SRC_PAD (parse), caps)) {
+      GST_DEBUG_OBJECT (dcaparse, "Failed to set src cap");
+      return GST_FLOW_ERROR;
+    }
     gst_caps_unref (caps);
 
     dcaparse->rate = rate;
@@ -443,41 +1185,17 @@ gst_dca_parse_handle_frame (GstBaseParse * parse,
     dcaparse->block_size = block_size;
     dcaparse->frame_size = size;
 
-    gst_base_parse_set_frame_rate (parse, rate, block_size, 0, 0);
+    if (dcaparse->dts_stream_type == DTS_CORE_ONLY)
+      gst_base_parse_set_frame_rate (parse, rate, block_size, 0, 0);
   }
 
 cleanup:
-  /* it is possible that DTS HD substream after DTS core */
-  if (parse->flags & GST_BASE_PARSE_FLAG_DRAINING || map.size >= size + 9) {
-    extra_size = 0;
-    if (map.size >= size + 9) {
-      const guint8 *next = map.data + size;
-      /* Check for DTS_SYNCWORD_SUBSTREAM */
-      if (next[0] == 0x64 && next[1] == 0x58 && next[2] == 0x20
-          && next[3] == 0x25) {
-        /* 7.4.1 Extension Substream Header */
-        GstBitReader reader;
-        gst_bit_reader_init (&reader, next + 4, 5);
-        gst_bit_reader_skip (&reader, 8 + 2);   /* skip UserDefinedBits and nExtSSIndex) */
-        if (gst_bit_reader_get_bits_uint8_unchecked (&reader, 1) == 0) {
-          gst_bit_reader_skip (&reader, 8);
-          extra_size =
-              gst_bit_reader_get_bits_uint32_unchecked (&reader, 16) + 1;
-        } else {
-          gst_bit_reader_skip (&reader, 12);
-          extra_size =
-              gst_bit_reader_get_bits_uint32_unchecked (&reader, 20) + 1;
-        }
-      }
-    }
-    gst_buffer_unmap (buf, &map);
-    if (ret == GST_FLOW_OK && size + extra_size <= map.size) {
-      ret = gst_base_parse_finish_frame (parse, frame, size + extra_size);
-    } else {
-      ret = GST_FLOW_OK;
-    }
+  gst_buffer_unmap (buf, &map);
+
+  if (ret == GST_FLOW_OK && size <= map.size) {
+    ret = gst_base_parse_finish_frame (parse, frame, size);
   } else {
-    gst_buffer_unmap (buf, &map);
+    ret = GST_FLOW_OK;
   }
 
   return ret;
@@ -502,6 +1220,7 @@ gst_dca_parse_chain_priv (GstPad * pad, GstObject * parent, GstBuffer * buffer)
   size = gst_buffer_get_size (buffer);
   if (size >= 2) {
     newbuf = gst_buffer_copy_region (buffer, GST_BUFFER_COPY_ALL, 2, size - 2);
+    gst_buffer_copy_into (newbuf, buffer, GST_BUFFER_COPY_METADATA, 0, -1);
     gst_buffer_unref (buffer);
     ret = dcaparse->baseparse_chainfunc (pad, parent, newbuf);
   } else {
@@ -612,6 +1331,8 @@ gst_dca_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
     /* also signals the end of first-frame processing */
     dcaparse->sent_codec_tag = TRUE;
   }
+
+  frame->flags |= GST_BASE_PARSE_FRAME_FLAG_CLIP;
 
   return GST_FLOW_OK;
 }

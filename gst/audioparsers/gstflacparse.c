@@ -184,7 +184,7 @@ static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
     );
 
 static GstBuffer *gst_flac_parse_generate_vorbiscomment (GstFlacParse *
-    flacparse);
+    flacparse, gboolean is_last);
 
 static inline void gst_flac_parse_reset_buffer_time_and_offset (GstBuffer *
     buffer);
@@ -375,7 +375,7 @@ gst_flac_parse_stop (GstBaseParse * parse)
   return TRUE;
 }
 
-static const guint8 sample_size_table[] = { 0, 8, 12, 0, 16, 20, 24, 0 };
+static const guint8 sample_size_table[] = { 0, 8, 12, 0, 16, 20, 24, 32 };
 
 static const guint16 blocksize_table[16] = {
   0, 192, 576 << 0, 576 << 1, 576 << 2, 576 << 3, 0, 0,
@@ -447,7 +447,7 @@ gst_flac_parse_frame_header_is_valid (GstFlacParse * flacparse,
 
   /* bits per sample */
   bps = gst_bit_reader_get_bits_uint8_unchecked (&reader, 3);
-  if (bps == 0x03 || bps == 0x07) {
+  if (bps == 0x03) {
     goto error;
   } else if (bps == 0 && flacparse->bps == 0) {
     goto need_streaminfo;
@@ -1110,6 +1110,7 @@ gst_flac_parse_handle_picture (GstFlacParse * flacparse, GstBuffer * buffer)
   GstMapInfo map;
   guint32 img_len = 0, img_type = 0;
   guint32 img_mimetype_len = 0, img_description_len = 0;
+  const guint8 *img_data;
 
   gst_buffer_map (buffer, &map, GST_MAP_READ);
   gst_byte_reader_init (&reader, map.data, map.size);
@@ -1136,7 +1137,7 @@ gst_flac_parse_handle_picture (GstFlacParse * flacparse, GstBuffer * buffer)
   if (!gst_byte_reader_get_uint32_be (&reader, &img_len))
     goto error;
 
-  if (gst_byte_reader_get_pos (&reader) + img_len > map.size)
+  if (!gst_byte_reader_get_data (&reader, img_len, &img_data))
     goto error;
 
   GST_INFO_OBJECT (flacparse, "Got image of %d bytes", img_len);
@@ -1145,8 +1146,7 @@ gst_flac_parse_handle_picture (GstFlacParse * flacparse, GstBuffer * buffer)
     if (flacparse->tags == NULL)
       flacparse->tags = gst_tag_list_new_empty ();
 
-    gst_tag_list_add_id3_image (flacparse->tags,
-        map.data + gst_byte_reader_get_pos (&reader), img_len, img_type);
+    gst_tag_list_add_id3_image (flacparse->tags, img_data, img_len, img_type);
   }
 
   gst_buffer_unmap (buffer, &map);
@@ -1242,10 +1242,12 @@ gst_flac_parse_handle_headers (GstFlacParse * flacparse)
   GstBuffer *vorbiscomment = NULL;
   GstBuffer *streaminfo = NULL;
   GstBuffer *marker = NULL;
+  GstBuffer *last_header = NULL;
   GValue array = { 0, };
   GstCaps *caps;
   GList *l;
   GstFlowReturn res = GST_FLOW_OK;
+  gboolean is_streaminfo_last = FALSE;
 
   caps = gst_caps_new_simple ("audio/x-flac",
       "channels", G_TYPE_INT, flacparse->channels,
@@ -1267,6 +1269,7 @@ gst_flac_parse_handle_headers (GstFlacParse * flacparse)
       marker = header;
     } else if (map.size > 1 && (map.data[0] & 0x7f) == 0) {
       streaminfo = header;
+      is_streaminfo_last = (map.data[0] & 0x80) != 0;
     } else if (map.size > 1 && (map.data[0] & 0x7f) == 4) {
       vorbiscomment = header;
     }
@@ -1279,8 +1282,11 @@ gst_flac_parse_handle_headers (GstFlacParse * flacparse)
   if (vorbiscomment == NULL && streaminfo != NULL) {
     GST_DEBUG_OBJECT (flacparse,
         "missing vorbiscomment header; generating dummy");
-    vorbiscomment = gst_flac_parse_generate_vorbiscomment (flacparse);
-    flacparse->headers = g_list_insert (flacparse->headers, vorbiscomment,
+    /* this vorbiscomment header is inserted after streaminfo and inherits its last-metadata-block flag */
+    vorbiscomment =
+        gst_flac_parse_generate_vorbiscomment (flacparse, is_streaminfo_last);
+    flacparse->headers =
+        g_list_insert (flacparse->headers, vorbiscomment,
         g_list_index (flacparse->headers, streaminfo) + 1);
   }
 
@@ -1315,6 +1321,8 @@ gst_flac_parse_handle_headers (GstFlacParse * flacparse)
     writemap.data[8] = (num & 0x00FF) >> 0;
     memcpy (writemap.data + 9, "fLaC", 4);
     memcpy (writemap.data + 13, sinfomap.data, sinfomap.size);
+    /* clear the last-metadata-block flag because a VORBISCOMMENT always follows */
+    writemap.data[13] = 0x00;   /* is_last = 0; type = 0; */
     _value_array_append_buffer (&array, buf);
 
     gst_buffer_unmap (streaminfo, &sinfomap);
@@ -1322,18 +1330,33 @@ gst_flac_parse_handle_headers (GstFlacParse * flacparse)
     gst_buffer_unref (buf);
   }
 
-  /* add VORBISCOMMENT header */
-  _value_array_append_buffer (&array, vorbiscomment);
-
-  /* add other headers, if there are any */
+  l = g_list_last(flacparse->headers);
+  last_header = l->data;
+  /* add other headers, including VORBISCOMMENT */
   for (l = flacparse->headers; l; l = l->next) {
     if (GST_BUFFER_CAST (l->data) != marker &&
         GST_BUFFER_CAST (l->data) != streaminfo &&
-        GST_BUFFER_CAST (l->data) != vorbiscomment) {
+        GST_BUFFER_CAST (l->data) != last_header) {
       _value_array_append_buffer (&array, GST_BUFFER_CAST (l->data));
     }
   }
 
+  /* VORBIS_COMMENT & PADDING metadata blocks available in stream are discarded.
+   * When these are dropped the last metadata block's Last-metadata-block flag will not be proper.
+   * So make sure Last-metadata-block flag of last metadata block header to have valid end flag. */
+  if (last_header) {
+    GstBuffer *buf;
+    GstMapInfo map;
+
+    gst_buffer_map (last_header, &map, GST_MAP_READ);
+    buf = gst_buffer_copy_region (last_header, GST_BUFFER_COPY_ALL, 0, map.size);
+    gst_buffer_unmap (last_header, &map);
+    gst_buffer_map (buf, &map, GST_MAP_WRITE);
+    map.data[0] = map.data[0] | 0x80;
+    gst_buffer_unmap (buf, &map);
+    _value_array_append_buffer (&array, buf);
+    gst_buffer_unref (buf);
+  }
   gst_structure_set_value (gst_caps_get_structure (caps, 0),
       "streamheader", &array);
   g_value_unset (&array);
@@ -1382,7 +1405,8 @@ push_headers:
 
 /* empty vorbiscomment */
 static GstBuffer *
-gst_flac_parse_generate_vorbiscomment (GstFlacParse * flacparse)
+gst_flac_parse_generate_vorbiscomment (GstFlacParse * flacparse,
+    gboolean is_last)
 {
   GstTagList *taglist = gst_tag_list_new_empty ();
   guchar header[4];
@@ -1390,7 +1414,7 @@ gst_flac_parse_generate_vorbiscomment (GstFlacParse * flacparse)
   GstBuffer *vorbiscomment;
   GstMapInfo map;
 
-  header[0] = 0x84;             /* is_last = 1; type = 4; */
+  header[0] = (is_last ? 0x80 : 0x00) | 0x04;   /* is_last may vary; type = 4; */
 
   vorbiscomment =
       gst_tag_list_to_vorbiscomment_buffer (taglist, header,
@@ -1489,7 +1513,7 @@ gst_flac_parse_generate_headers (GstFlacParse * flacparse)
   flacparse->headers = g_list_append (flacparse->headers, streaminfo);
 
   flacparse->headers = g_list_append (flacparse->headers,
-      gst_flac_parse_generate_vorbiscomment (flacparse));
+      gst_flac_parse_generate_vorbiscomment (flacparse, TRUE));
 
   return TRUE;
 }
@@ -1901,11 +1925,26 @@ gst_flac_parse_get_sink_caps (GstBaseParse * parse, GstCaps * filter)
 static gboolean
 gst_flac_parse_set_sink_caps (GstBaseParse * parse, GstCaps * caps)
 {
+  GstCaps *current_caps;
+  GstFlacParse *flacparse = GST_FLAC_PARSE (parse);
+
   /* If caps are changing, drain any pending frames we have so that afterwards
    * we can potentially accept a new stream that is starting with the FLAC
    * headers again. If headers appear in the middle of the stream we can't
    * detect them
    */
   gst_base_parse_drain (parse);
+
+  /* If the caps did really change we need to reset the parser */
+  current_caps = gst_pad_get_current_caps (GST_BASE_PARSE_SINK_PAD (parse));
+  if (current_caps) {
+    if (!gst_caps_is_strictly_equal (caps, current_caps)) {
+      GST_DEBUG_OBJECT (flacparse, "Reset parser on sink pad caps change");
+      gst_flac_parse_stop (parse);
+      gst_flac_parse_start (parse);
+    }
+    gst_caps_unref (current_caps);
+  }
+
   return TRUE;
 }
