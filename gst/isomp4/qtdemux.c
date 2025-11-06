@@ -2455,6 +2455,7 @@ gst_qtdemux_reset (GstQTDemux * qtdemux, gboolean hard)
         GST_BIN_FLAG_STREAMS_AWARE);
 #ifdef DOLBYHDR_SUPPORT
     /* Dolby HDR */
+    qtdemux->dolby_vision_disable = g_file_test("/tmp/dv_disable", G_FILE_TEST_EXISTS);
     qtdemux->is_dolby_hdr = FALSE;
     qtdemux->has_dolby_bl_cand = FALSE;
     qtdemux->has_dolby_el_cand = FALSE;
@@ -9138,10 +9139,15 @@ gst_qtdemux_configure_stream (GstQTDemux * qtdemux, QtDemuxStream * stream)
       }
 #ifdef DOLBYHDR_SUPPORT
       /* Prepare Dolby HDR related src caps */
-      if (qtdemux->is_dolby_hdr)
-        if (!qtdemux_prepare_dolby_track (qtdemux, stream))
+      if (qtdemux->is_dolby_hdr) {
+        if (qtdemux->dolby_vision_disable) {
+          GST_DEBUG_OBJECT (qtdemux, "Disabling dolby-vision per user configuration");
+          qtdemux->is_dolby_hdr = FALSE;
+        } else if (!qtdemux_prepare_dolby_track (qtdemux, stream)) {
           GST_DEBUG_OBJECT (qtdemux,
               "Fail to define dolby HDR stream configure");
+        }
+      }
 #endif
     }
   }

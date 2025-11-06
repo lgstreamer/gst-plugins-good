@@ -144,6 +144,7 @@ typedef struct _GstMatroskaDemux {
 #ifdef DOLBYHDR_SUPPORT
   /* Dolby HDR */
   gboolean dolby_vision_support;
+  gboolean dolby_vision_disable;
   gboolean is_dolby_hdr;
   gboolean has_dolby_bl_cand;
   gboolean has_dolby_el_cand;

@@ -352,6 +352,7 @@ gst_matroska_demux_reset (GstElement * element)
 
 #ifdef DOLBYHDR_SUPPORT
   /* Initialize Dolby HDR variables */
+  demux->dolby_vision_disable = g_file_test("/tmp/dv_disable", G_FILE_TEST_EXISTS);
   demux->is_dolby_hdr = FALSE;
   demux->has_dolby_bl_cand = FALSE;
   demux->has_dolby_el_cand = FALSE;
@@ -2141,9 +2142,11 @@ gst_matroska_demux_parse_stream (GstMatroskaDemux * demux, GstEbmlRead * ebml,
 
   /* Prepare Dolby HDR related src caps */
 #ifdef DOLBYHDR_SUPPORT
-  GST_DEBUG_OBJECT (demux, "is_dolby_hdr = %d", demux->is_dolby_hdr);
   if (demux->is_dolby_hdr) {
-    if (!matroska_demux_prepare_dolby_track (demux, context)) {
+    if (demux->dolby_vision_disable) {
+      GST_DEBUG_OBJECT (demux, "Disabling dolby-vision per user configuration");
+      demux->is_dolby_hdr = FALSE;
+    } else if (!matroska_demux_prepare_dolby_track (demux, context)) {
       GST_DEBUG_OBJECT (demux, "Fail to define dolby HDR stream configure");
     }
   }
